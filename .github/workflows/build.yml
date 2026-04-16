@@ -100,7 +100,7 @@ jobs:
           --additional-hooks-dir hooks/
           --add-data "src/dms/data:dms/data"
           --icon=src/dms/data/icon.ico
-          --name "DMS"
+          --name "DMS-macos"
           --exclude-module matplotlib
           --exclude-module pandas
           --exclude-module PyQt5
@@ -117,7 +117,7 @@ jobs:
           --additional-hooks-dir hooks/
           --add-data "src/dms/data:dms/data"
           --icon=src/dms/data/icon.ico
-          --name "DMS"
+          --name "DMS-linux"
           --exclude-module matplotlib
           --exclude-module pandas
           --exclude-module PyQt5
@@ -135,21 +135,34 @@ jobs:
           path: |
             dist/DMS_Portable.exe
             dist/DMS_Setup.exe
-      - name: Upload artifacts (macOS/Linux)
-        if: matrix.os != 'windows-latest'
+      - name: Upload artifacts (macOS)
+        if: matrix.os == 'macos-latest'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: deceptive-metadata-shredder-${{ matrix.os }}
-          path: dist/*
-      - name: Create release assets (Windows)
-        if: matrix.os == 'windows-latest'
+          path: dist/DMS-macos
+      - name: Upload artifacts (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: deceptive-metadata-shredder-${{ matrix.os }}
+          path: dist/DMS-linux
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: deceptive-metadata-shredder-*
+          merge-multiple: true
+          path: release-assets
+      - name: Create release assets
         uses: softprops/action-gh-release@7b4da11513bf3f43f9999e90eabced41ab8bb048
         with:
           files: |
-            dist/DMS_Portable.exe
-            dist/DMS_Setup.exe
-      - name: Create release assets (macOS/Linux)
-        if: matrix.os != 'windows-latest'
-        uses: softprops/action-gh-release@7b4da11513bf3f43f9999e90eabced41ab8bb048
-        with:
-          files: dist/*
+            release-assets/DMS_Portable.exe
+            release-assets/DMS_Setup.exe
+            release-assets/DMS-macos
+            release-assets/DMS-linux
