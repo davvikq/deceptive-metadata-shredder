@@ -159,7 +159,7 @@ jobs:
           merge-multiple: true
           path: release-assets
       - name: Create release assets
-        uses: softprops/action-gh-release@7b4da11513bf3f43f9999e90eabced41ab8bb048
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           files: |
             release-assets/DMS_Portable.exe
