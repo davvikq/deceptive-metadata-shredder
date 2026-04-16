@@ -23,6 +23,9 @@ dependencies = [
   "piexif>=1.1.3",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
 [project.scripts]
 dms = "dms.interfaces.cli:app"
 dms-gui = "dms.interfaces.gui.app:main"

@@ -48,8 +48,7 @@ tmp_dms_*/
 *_spoofed.*
 
 # exiftool binaries
-bin/exiftool.exe
-bin/exiftool
+bin/
 
 # Secrets
 .env

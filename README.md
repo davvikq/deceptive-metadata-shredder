@@ -1,8 +1,25 @@
 # Deceptive Metadata Shredder
 
+<p align="center">
+  <img src="assets/DMS.png" alt="DMS logo" width="280">
+</p>
+
 **Deceptive Metadata Shredder (DMS)** is a privacy-focused desktop tool that runs **entirely offline**. It helps you see what is hiding inside your files—GPS, device names, dates, authorship—and then **strip** that metadata or **replace** it with believable fake values, without having to trust a cloud service.
 
 Use it for photos, PDFs, Office documents, and common video formats. The graphical app walks you through everything; the command line is there when you want to script or automate.
+
+## Preview
+
+<table>
+  <tr>
+    <td width="50%" align="center"><strong>Main Window</strong></td>
+    <td width="50%" align="center"><strong>Compare / Clean & Spoof</strong></td>
+  </tr>
+  <tr>
+    <td><img src="assets/main-window.png" alt="DMS main window"></td>
+    <td><img src="assets/clean-spoof-window.png" alt="DMS compare and clean spoof view"></td>
+  </tr>
+</table>
 
 ---
 
@@ -131,9 +148,15 @@ On **macOS** / **Linux**, use `scripts/build_exe.sh` (see script for details). T
 
 ## Tests
 
+Install dev dependencies (includes `pytest`), then run the suite:
+
 ```powershell
-pytest
+pip install -r requirements-dev.txt
+pip install -e .
+python -m pytest
 ```
+
+Alternatively: `pip install -e ".[dev]"` then `python -m pytest`.
 
 ---
 
