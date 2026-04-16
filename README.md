@@ -13,7 +13,7 @@ Use it for photos, PDFs, Office documents, and common video formats. The graphic
 <table>
   <tr>
     <td width="50%" align="center"><strong>Main Window</strong></td>
-    <td width="50%" align="center"><strong>Compare / Clean & Spoof</strong></td>
+    <td width="50%" align="center"><strong>Clean & Spoof</strong></td>
   </tr>
   <tr>
     <td><img src="assets/main-window.png" alt="DMS main window"></td>
