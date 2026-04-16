@@ -100,7 +100,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/portable_bundle/bin | Out-Null
           Copy-Item dist/DMS_Portable.exe dist/portable_bundle/DMS_Portable.exe -Force
           Copy-Item bin/exiftool.exe dist/portable_bundle/bin/exiftool.exe -Force
-          Copy-Item bin/exiftool_files dist/portable_bundle/bin/exiftool_files -Recurse -Force
+          New-Item -ItemType Directory -Force -Path dist/portable_bundle/bin/exiftool_files | Out-Null
+          Copy-Item "bin/exiftool_files/*" "dist/portable_bundle/bin/exiftool_files" -Recurse -Force
           if (Test-Path dist/DMS_Portable.zip) { Remove-Item dist/DMS_Portable.zip -Force }
           Compress-Archive -Path dist/portable_bundle/* -DestinationPath dist/DMS_Portable.zip -Force
       - name: Build executable (macOS)
