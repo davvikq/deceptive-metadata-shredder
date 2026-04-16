@@ -59,8 +59,7 @@ jobs:
           Expand-Archive exiftool.zip -DestinationPath bin/exiftool_download -Force
           $packageRoot = Get-ChildItem bin/exiftool_download | Where-Object { $_.PSIsContainer } | Select-Object -First 1
           Move-Item (Join-Path $packageRoot.FullName "exiftool(-k).exe") "bin/exiftool.exe"
-          New-Item -ItemType Directory -Force -Path "bin/exiftool_files" | Out-Null
-          Get-ChildItem $packageRoot.FullName | Where-Object { $_.Name -ne "exiftool(-k).exe" } | Move-Item -Destination "bin/exiftool_files"
+          Move-Item (Join-Path $packageRoot.FullName "exiftool_files") "bin"
           Remove-Item exiftool.zip -Force
           Remove-Item "bin/exiftool_download" -Recurse -Force
       - name: Build executable (Windows)
