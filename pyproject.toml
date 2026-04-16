@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deceptive-metadata-shredder"
+version = "1.0.0"
+description = "Offline desktop app for metadata inspection, removal, and spoofing."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "davvik (GitHub: davvikq)" }]
+dependencies = [
+  "PySide6>=6.6.0",
+  "Pillow>=10.0.0",
+  "python-docx>=1.0.0",
+  "pypdf>=3.0.0",
+  "shapely>=2.0.0",
+  "Faker>=19.0.0",
+  "typer[all]>=0.9.0",
+  "rich>=13.0.0",
+  "watchdog>=3.0.0",
+  "piexif>=1.1.3",
+]
+
+[project.scripts]
+dms = "dms.interfaces.cli:app"
+dms-gui = "dms.interfaces.gui.app:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dms = ["data/*.json", "data/*.geojson", "data/*.svg", "data/*.ico"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

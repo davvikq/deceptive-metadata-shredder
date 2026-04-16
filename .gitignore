@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+share/python-wheels/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# PyInstaller
+*.spec
+!DMS_Portable.spec
+build/
+dist/
+*.pkg
+
+# Logs
+*.log
+dms_errors.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Temporary DMS files
+tmp_dms_*/
+*_cleaned.*
+*_spoofed.*
+
+# exiftool binaries
+bin/exiftool.exe
+bin/exiftool
+
+# Secrets
+.env
+*.pem
+*.key
+
+# OS
+desktop.ini
+.DS_Store
