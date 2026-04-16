@@ -55,6 +55,8 @@ PDF_SUFFIXES = {".pdf"}
 HEIC_SUFFIXES = {".heic", ".heif"}
 RAW_SUFFIXES = {suffix for suffix, kind in SUPPORTED_FORMATS.items() if kind == "raw"}
 RAW_READONLY_TAGS = {"InternalSerialNumber"}
+IMAGE_PARSE_WARNING = "Image metadata could not be fully parsed. Showing limited report."
+IMAGE_THUMBNAIL_WARNING = "Could not render image preview thumbnail."
 
 FIELD_DEFINITIONS: dict[str, tuple[str, str, bool]] = {
     "GPSLatitude": ("GPS Latitude", "gps", True),
@@ -508,6 +510,11 @@ def _build_report(
     )
 
 
+def _append_warning_once(warnings: list[str], message: str) -> None:
+    if message not in warnings:
+        warnings.append(message)
+
+
 def analyze(path: Path) -> FileReport:
     """Read metadata from *path* and return a structured report."""
 
@@ -520,24 +527,36 @@ def analyze(path: Path) -> FileReport:
     warnings = _report_warnings(file_path)
 
     if suffix in IMAGE_SUFFIXES:
-        if suffix in HEIC_SUFFIXES:
-            try:
-                fields = _analyze_with_exiftool(file_path)
-            except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
-                fields = []
-        else:
-            try:
-                fields = _analyze_with_exiftool(file_path)
-            except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
-                fields = _analyze_image_fallback(file_path)
-        thumbnail = _extract_thumbnail(file_path)
-        if thumbnail is None and suffix in {".jpg", ".jpeg", ".tiff", ".tif", ".webp"}:
-            with Image.open(file_path) as image:
-                preview = image.copy()
-                preview.thumbnail((256, 256))
-                buffer = io.BytesIO()
-                preview.save(buffer, format="JPEG")
-                thumbnail = buffer.getvalue()
+        try:
+            if suffix in HEIC_SUFFIXES:
+                try:
+                    fields = _analyze_with_exiftool(file_path)
+                except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError):
+                    fields = []
+            else:
+                try:
+                    fields = _analyze_with_exiftool(file_path)
+                except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError):
+                    fields = _analyze_image_fallback(file_path)
+        except Exception:
+            logging.exception("Failed to analyze image: %s", file_path)
+            fields = []
+            _append_warning_once(warnings, IMAGE_PARSE_WARNING)
+
+        thumbnail = None
+        try:
+            thumbnail = _extract_thumbnail(file_path)
+            if thumbnail is None and suffix in {".jpg", ".jpeg", ".tiff", ".tif", ".webp"}:
+                with Image.open(file_path) as image:
+                    preview = image.copy()
+                    preview.thumbnail((256, 256))
+                    buffer = io.BytesIO()
+                    preview.save(buffer, format="JPEG")
+                    thumbnail = buffer.getvalue()
+        except Exception:
+            logging.exception("Failed to build image thumbnail: %s", file_path)
+            _append_warning_once(warnings, IMAGE_THUMBNAIL_WARNING)
+
         return _build_report(file_path, file_type, fields, thumbnail, warnings)
 
     if suffix in PDF_SUFFIXES:

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from dms.core import analyzer
 from dms.core.analyzer import analyze
 
 
@@ -53,3 +54,27 @@ def test_tiff_metadata_is_parsed() -> None:
     assert report.file_type == "tiff"
     assert "Make" in fields
     assert "DateTimeOriginal" in fields
+
+
+def test_image_analysis_falls_back_when_primary_and_fallback_fail(monkeypatch) -> None:
+    target = FIXTURES / "test_with_gps.jpg"
+
+    monkeypatch.setattr(analyzer, "_analyze_with_exiftool", lambda _path: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(analyzer, "_analyze_image_fallback", lambda _path: (_ for _ in ()).throw(OSError("bad image")))
+    monkeypatch.setattr(analyzer, "_extract_thumbnail", lambda _path: b"thumb")
+
+    report = analyze(target)
+
+    assert report.file_type == "jpeg"
+    assert report.fields == []
+    assert analyzer.IMAGE_PARSE_WARNING in report.warnings
+
+
+def test_image_thumbnail_failure_only_adds_warning(monkeypatch) -> None:
+    target = FIXTURES / "test_with_gps.jpg"
+
+    monkeypatch.setattr(analyzer, "_extract_thumbnail", lambda _path: (_ for _ in ()).throw(OSError("thumb fail")))
+
+    report = analyze(target)
+
+    assert analyzer.IMAGE_THUMBNAIL_WARNING in report.warnings
