@@ -93,6 +93,16 @@ jobs:
         run: |
           $appVersion = "${{ github.ref_name }}".TrimStart('v')
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "scripts\installer.iss" "/DMyAppVersion=$appVersion"
+      - name: Package portable bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/portable_bundle/bin | Out-Null
+          Copy-Item dist/DMS_Portable.exe dist/portable_bundle/DMS_Portable.exe -Force
+          Copy-Item bin/exiftool.exe dist/portable_bundle/bin/exiftool.exe -Force
+          Copy-Item bin/exiftool_files dist/portable_bundle/bin/exiftool_files -Recurse -Force
+          if (Test-Path dist/DMS_Portable.zip) { Remove-Item dist/DMS_Portable.zip -Force }
+          Compress-Archive -Path dist/portable_bundle/* -DestinationPath dist/DMS_Portable.zip -Force
       - name: Build executable (macOS)
         if: runner.os == 'macOS'
         run: >
@@ -133,7 +143,7 @@ jobs:
         with:
           name: deceptive-metadata-shredder-${{ matrix.os }}
           path: |
-            dist/DMS_Portable.exe
+            dist/DMS_Portable.zip
             dist/DMS_Setup.exe
       - name: Upload artifacts (macOS)
         if: matrix.os == 'macos-latest'
@@ -162,7 +172,7 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           files: |
-            release-assets/DMS_Portable.exe
+            release-assets/DMS_Portable.zip
             release-assets/DMS_Setup.exe
             release-assets/DMS-macos
             release-assets/DMS-linux
