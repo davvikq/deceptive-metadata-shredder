@@ -86,18 +86,6 @@ If you want raw breadth, ExifTool is unbeatable. DMS sits **on top of ExifTool**
 
 ## Install
 
-### Via pipx (recommended)
-
-```bash
-pipx install dms-shredder
-```
-
-### Via pip
-
-```bash
-pip install dms-shredder
-```
-
 That installs two commands on your PATH:
 
 | Command   | What it is                  |
