@@ -257,14 +257,6 @@ Yes. Install via `pipx`/`pip` and `brew install exiftool` (macOS) or your distro
 
 ---
 
-## Contributing
-
-Issues, PRs, and feature requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
-
-For security issues, please follow [SECURITY.md](SECURITY.md) and **do not** open a public issue.
-
----
-
 ## License
 
 [MIT](LICENSE) — use it, fork it, ship it.
