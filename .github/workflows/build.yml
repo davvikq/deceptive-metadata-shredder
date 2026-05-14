@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     env:
-      EXIFTOOL_VERSION: "13.56"
+      EXIFTOOL_VERSION: "13.58"
     strategy:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
