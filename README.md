@@ -247,12 +247,11 @@ Yes. Install via `pipx`/`pip` and `brew install exiftool` (macOS) or your distro
 
 ## License
 
-[MIT](LICENSE) — use it, fork it, ship it.
+[MIT](LICENSE) — use it, fork it, ship it. © 2026 Davvik.
 
 ---
 
 <p align="center">
   <a href="https://www.producthunt.com/products/dms-deceptive-metadata-shredder">Product Hunt</a> ·
-  <a href="https://github.com/davvikq/deceptive-metadata-shredder/releases">Releases</a> ·
-  <a href="https://t.me/fronsx">Telegram</a>
+  <a href="https://github.com/davvikq/deceptive-metadata-shredder/releases">Releases</a> 
 </p>
