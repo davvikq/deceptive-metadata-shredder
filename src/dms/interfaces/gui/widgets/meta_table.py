@@ -23,6 +23,12 @@ from dms.interfaces.gui.widgets.tag_badge import TagBadge
 # OS-managed timestamp fields: they cannot be deleted, only overwritten.
 _SYSTEM_DATE_KEYS: frozenset[str] = frozenset({"FileModifyDate", "FileAccessDate", "FileCreateDate"})
 
+_FS_DATE_TOOLTIPS: dict[str, str] = {
+    "FileModifyDate": "fsdate_modified_tip",
+    "FileAccessDate": "fsdate_accessed_tip",
+    "FileCreateDate": "fsdate_created_tip",
+}
+
 
 def _is_region_field(field: MetaField) -> bool:
     normalized = field.key.split(":")[-1].split(".")[-1]
@@ -43,7 +49,7 @@ class MetaTable(QTreeWidget):
         self._action_font = QFont("Segoe UI", 11, QFont.Medium)
 
         self.setColumnCount(4)
-        self.setHeaderLabels(["Tag", "Value", "Status", "Actions"])
+        self.setHeaderLabels(self._header_labels())
         self.setRootIsDecorated(False)
         self.setAlternatingRowColors(False)
         self.setUniformRowHeights(True)
@@ -69,12 +75,16 @@ class MetaTable(QTreeWidget):
     def refresh_locale(self) -> None:
         """Repaint text using the current locale."""
 
-        self.setHeaderLabels(["Tag", "Value", "Status", "Actions"])
+        self.setHeaderLabels(self._header_labels())
         if self.report is not None:
             self._populate()
 
     def _locale(self) -> str:
         return self.locale_getter()
+
+    def _header_labels(self) -> list[str]:
+        locale = self._locale()
+        return [tr(locale, key) for key in ("col_tag", "col_value", "col_status", "col_actions")]
 
     def _visible_fields(self) -> list[MetaField]:
         if self.report is None:
@@ -124,6 +134,11 @@ class MetaTable(QTreeWidget):
                 item = QTreeWidgetItem(parent, [field.label, value, "", ""])
                 item.setData(0, Qt.UserRole, field)
                 item.setToolTip(1, field.exiftool_tag)
+                fs_tip = _FS_DATE_TOOLTIPS.get(field.key)
+                if fs_tip is not None:
+                    tip_text = tr(locale, fs_tip)
+                    item.setToolTip(0, tip_text)
+                    item.setToolTip(1, tip_text)
                 if field.is_computed:
                     tip_key = "region_tooltip" if _is_region_field(field) else "computed_tooltip"
                     item.setToolTip(3, tr(locale, tip_key))

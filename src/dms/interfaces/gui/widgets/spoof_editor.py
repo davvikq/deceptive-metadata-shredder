@@ -73,9 +73,15 @@ class SpoofEditor(GlassCard):
         self.title_label.setFont(self._title_font)
         header.addWidget(self.title_label, 1)
 
-        self.close_button = QPushButton("x", self)
+        self.close_button = QPushButton("✕", self)
         self.close_button.setFixedSize(28, 28)
-        self.close_button.setFont(self._button_font)
+        self.close_button.setFont(QFont("Segoe UI", 13))
+        self.close_button.setCursor(Qt.PointingHandCursor)
+        self.close_button.setStyleSheet(
+            "QPushButton { padding:0; border:none; border-radius:6px; background:transparent; color:#94a3b8; }"
+            "QPushButton:hover { background: rgba(239,68,68,0.2); color:#ef4444; }"
+            "QPushButton:pressed { background: rgba(239,68,68,0.35); color:#ef4444; }"
+        )
         self.close_button.clicked.connect(self.closeRequested)
         header.addWidget(self.close_button)
         layout.addLayout(header)
@@ -120,6 +126,7 @@ class SpoofEditor(GlassCard):
         self.refresh_locale()
 
     def refresh_locale(self) -> None:
+        self.close_button.setToolTip(self._t("close"))
         if self.field is not None:
             self.title_label.setText(f"{self._t('edit')} {self.field.label}")
         self.apply_button.setText(self._t("apply"))

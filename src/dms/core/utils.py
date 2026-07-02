@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+EXIFTOOL_TIMEOUT = 120
+
 
 def get_subprocess_flags() -> int:
     """Return creation flags that hide console windows on Windows."""
@@ -32,6 +34,7 @@ def remove_exiftool_signature(file_path: Path, exiftool_path: str) -> None:
             ],
             capture_output=True,
             check=False,
+            timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
         )
     except Exception as exc:  # pragma: no cover - filesystem edge cases

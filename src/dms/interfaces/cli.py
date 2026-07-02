@@ -33,7 +33,7 @@ from dms.core.exiftool_tags import validate_exif_tag
 from dms.core.models import FileReport, MetaField, SpoofProfile
 from dms.core.sanitizer import remove_all
 from dms.core.spoofer import apply_smart_spoof, apply_spoof
-from dms.core.utils import get_subprocess_flags
+from dms.core.utils import EXIFTOOL_TIMEOUT, get_subprocess_flags
 from dms.interfaces.watcher import DMSEventHandler
 
 
@@ -152,6 +152,7 @@ def get_exiftool_version() -> str:
             capture_output=True,
             text=True,
             check=False,
+            timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
         )
         version = (result.stdout or "").strip()
@@ -370,6 +371,7 @@ def _command_summary() -> Table:
     table.add_column("Command", style="bright_cyan")
     table.add_column("What it does", style="white")
     table.add_row("dms analyze <file>", "Show all fields and highlight sensitive metadata")
+    table.add_row("dms verify <file>", "Check whether a file still holds sensitive metadata")
     table.add_row("dms clean <file>", "Write a copy with metadata stripped (*_cleaned by default)")
     table.add_row("dms spoof <file>", "Replace GPS/device/dates/author with plausible values")
     table.add_row("dms watch <folder>", "React to new files in a folder (optional dms_cleaned/ output)")
@@ -532,7 +534,7 @@ def _remove_residual_fields(path: Path, fields: list[MetaField]) -> int:
     if applied == 0:
         return 0
     args.extend(["-overwrite_original", str(path)])
-    result = subprocess.run(args, capture_output=True, text=True, check=False, creationflags=get_subprocess_flags())
+    result = subprocess.run(args, capture_output=True, text=True, check=False, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags())
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "Failed to remove residual fields.")
     return applied
@@ -554,6 +556,21 @@ def _print_info_codes(info_codes: list[str]) -> None:
     for code in info_codes:
         message = CLI_INFO_MESSAGES.get(code, code)
         console.print(f"[yellow]• {message}[/yellow]")
+
+
+def _render_verification(path: Path) -> bool:
+    residual = analyzer.residual_sensitive_fields(analyzer.analyze(path))
+    if not residual:
+        console.print("[bold green]✓ Verified:[/bold green] no sensitive metadata remains.")
+        return True
+    console.print(f"[bold yellow]! Verification:[/bold yellow] {len(residual)} sensitive field(s) still present:")
+    table = Table(box=box.ROUNDED, header_style="bold bright_white")
+    table.add_column("Field", style="bright_cyan")
+    table.add_column("Value", style="white", overflow="fold")
+    for field in residual:
+        table.add_row(field.label, _field_value(field.value))
+    console.print(table)
+    return False
 
 
 def _process_clean(file: Path, output: Path | None = None) -> tuple[Path, int]:
@@ -635,6 +652,22 @@ def analyze(
 
 
 @app.command()
+def verify(
+    file: Path = typer.Argument(..., exists=True, dir_okay=False, help="File to check."),
+) -> None:
+    """Check whether a file still contains sensitive metadata (read-only)."""
+
+    try:
+        _ensure_supported(file)
+        if not _render_verification(file):
+            raise typer.Exit(1)
+    except (typer.Exit, typer.Abort):
+        raise
+    except Exception as exc:
+        handle_exception(exc)
+
+
+@app.command()
 def clean(
     file: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source file."),
     output: Path | None = typer.Option(None, "--output", "-o", help="Destination path; default is sibling *_cleaned."),
@@ -666,6 +699,7 @@ def clean(
         console.print(f"[bold green]✓ Cleaned:[/bold green] {result.name}")
         console.print(f"Removed [bold red]{sensitive}[/bold red] sensitive fields.")
         console.print(f"[dim white]Saved to:[/dim white] {result}")
+        _render_verification(result)
     except (typer.Exit, typer.Abort):
         raise
     except Exception as exc:

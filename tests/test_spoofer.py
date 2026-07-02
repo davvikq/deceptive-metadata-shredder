@@ -620,9 +620,9 @@ def test_batch_clean_residual_protects_spoofed_device_category(tmp_path) -> None
     """BatchWorker._clean_residual must not list device fields when device category is spoofed."""
     import copy
     from dms.interfaces.gui.app import (
-        BatchWorker,
         _populate_session_keys,
         _apply_states_to_report,
+        _select_residual_fields,
     )
 
     original = tmp_path / "photo.jpg"
@@ -661,31 +661,7 @@ def test_batch_clean_residual_protects_spoofed_device_category(tmp_path) -> None
 
     assert session.spoofed_keys, "spoofed_keys should be populated after _populate_session_keys"
 
-    worker = BatchWorker([], "spoof_clean", "en")
-
-    residual_fields: list[MetaField] = []
-    for field in spoofed_report.fields:
-        if not field.is_sensitive or field.is_computed:
-            continue
-        if field.status in {"spoofed", "removed", "clean"}:
-            continue
-        from dms.interfaces.gui.app import _field_aliases, _is_always_delete_field, _SYSTEM_DATE_KEYS
-        if _is_always_delete_field(field):
-            continue
-        if field.key in _SYSTEM_DATE_KEYS:
-            continue
-        aliases = _field_aliases(field)
-        if aliases & session.spoofed_keys:
-            continue
-        spoofed_categories: set[str] = set()
-        for f in spoofed_report.fields:
-            fa = _field_aliases(f)
-            if f.status == "spoofed" or fa & session.spoofed_keys:
-                spoofed_categories.add(f.category)
-        if field.category in spoofed_categories:
-            continue
-        residual_fields.append(field)
-
+    residual_fields = _select_residual_fields(spoofed_report, session.spoofed_keys)
     residual_keys = {f.key for f in residual_fields}
 
     assert "Make" not in residual_keys, "Make should be protected (device category spoofed)"

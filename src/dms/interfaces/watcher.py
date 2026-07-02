@@ -99,10 +99,11 @@ class DMSEventHandler(FileSystemEventHandler):
         if self.output_dir is not None:
             self.output_dir.mkdir(parents=True, exist_ok=True)
         if self.mode == "spoof":
-            dest: Path | None = None
             if self.output_dir is not None:
                 dest = self.output_dir / f"{target.stem}_spoofed{target.suffix}"
-            _, _, _ = apply_smart_spoof(report, output_path=dest)
+            else:
+                dest = target.with_name(f"{target.stem}_spoofed{target.suffix}")
+            apply_smart_spoof(report, output_path=dest)
         else:
             out: Path | None = None
             if self.output_dir is not None:

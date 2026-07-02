@@ -305,6 +305,30 @@ def _is_region_field(meta_field: MetaField) -> bool:
     return False
 
 
+def _select_residual_fields(report: FileReport, spoofed_keys: set[str]) -> list[MetaField]:
+    spoofed_categories: set[str] = set()
+    for field in report.fields:
+        if field.status == "spoofed" or _field_aliases(field) & spoofed_keys:
+            spoofed_categories.add(field.category)
+
+    residual: list[MetaField] = []
+    for field in report.fields:
+        if not field.is_sensitive or field.is_computed:
+            continue
+        if field.status in {"spoofed", "removed", "clean"}:
+            continue
+        if _is_always_delete_field(field):
+            continue
+        if field.key in _SYSTEM_DATE_KEYS:
+            continue
+        if _field_aliases(field) & spoofed_keys:
+            continue
+        if field.category != "other" and field.category in spoofed_categories:
+            continue
+        residual.append(field)
+    return residual
+
+
 def _nuke_region_blocks(target: Path) -> None:
     exiftool = require_exiftool()
     args = [exiftool, "-overwrite_original", "-m"]
@@ -478,33 +502,11 @@ class BatchWorker(QThread):
 
     def _clean_residual(self, report: FileReport, session: FileSession | None = None) -> int:
         spoofed = session.spoofed_keys if session is not None else set()
-
-        spoofed_categories: set[str] = set()
-        for field in report.fields:
-            aliases = _field_aliases(field)
-            if field.status == "spoofed" or aliases & spoofed:
-                spoofed_categories.add(field.category)
-
-        residual_fields: list[MetaField] = []
-        for field in report.fields:
-            if not field.is_sensitive or field.is_computed:
-                continue
-            if field.status in {"spoofed", "removed", "clean"}:
-                continue
-            if _is_always_delete_field(field):
-                continue
-            if field.key in _SYSTEM_DATE_KEYS:
-                continue
-            aliases = _field_aliases(field)
-            if aliases & spoofed:
-                continue
-            if field.category != "other" and field.category in spoofed_categories:
-                continue
-            residual_fields.append(field)
+        residual_fields = _select_residual_fields(report, spoofed)
 
         logging.debug(
-            "batch _clean_residual: spoofed_keys=%s, spoofed_categories=%s, residual=%s",
-            spoofed, spoofed_categories, [f.key for f in residual_fields],
+            "batch _clean_residual: spoofed_keys=%s, residual=%s",
+            spoofed, [f.key for f in residual_fields],
         )
 
         always_delete = [
@@ -841,42 +843,7 @@ class MainWindow(QMainWindow):
         if current is None:
             return []
         spoofed = self.session.spoofed_keys if self.session is not None else set()
-        spoofed_lower = {k.lower() for k in spoofed}
-
-        # Partial category spoof → don't strip sibling tags user may still want.
-        spoofed_categories: set[str] = set()
-        for field in current.fields:
-            aliases = self._field_aliases(field)
-            if aliases & spoofed or field.status == "spoofed":
-                spoofed_categories.add(field.category)
-
-        result: list[MetaField] = []
-        for field in current.fields:
-            if not field.is_sensitive or field.is_computed:
-                continue
-            if field.status in {"spoofed", "removed", "clean"}:
-                continue
-            if _is_always_delete_field(field):
-                continue
-            aliases = self._field_aliases(field)
-            if aliases & spoofed:
-                continue
-            if field.key.lower() in spoofed_lower:
-                continue
-            linked_hit = False
-            for _source, linked in LINKED_TAGS.items():
-                linked_set = {self._canonical_key(item) for item in linked}
-                field_canonical = self._canonical_key(field.key)
-                if field_canonical in linked_set or _source == field_canonical:
-                    if linked_set & spoofed or _source in spoofed:
-                        linked_hit = True
-                        break
-            if linked_hit:
-                continue
-            if field.category != "other" and field.category in spoofed_categories:
-                continue
-            result.append(field)
-        return result
+        return _select_residual_fields(current, spoofed)
 
     def _update_clean_residual_visibility(self) -> None:
         if self.session is None:

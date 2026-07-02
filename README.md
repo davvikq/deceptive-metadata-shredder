@@ -169,6 +169,7 @@ dms batch ./a.jpg ./b.png --output-dir ./out --mode spoof --yes
 | `dms`                  | Banner and short command list                                                                     |
 | `dms --version`        | Version, Python, and ExifTool status                                                              |
 | `dms analyze <file>`   | List metadata. `--format` is `table`, `json`, or `minimal`. Read-only.                            |
+| `dms verify <file>`    | Report any sensitive metadata still present. Read-only; exits non-zero if the file is not clean.   |
 | `dms clean <file>`     | Remove all metadata into a new file (`*_cleaned` by default). `-o` sets path. `--yes` skips prompt.|
 | `dms spoof <file>`     | Smart or guided spoofing. Flags: `--gps`, `--device`, `--author`, `--dates`, `-o`, `--yes`, `--residual`. ExifTool required. |
 | `dms watch <folder>`   | Watch for **new** files. `--mode clean\|spoof`, `--recursive`, `--collect-subfolder`, `--all`. Ctrl+C stops. |
@@ -229,7 +230,7 @@ Empty metadata is sometimes more suspicious than realistic metadata. Spoofing ma
 Yes. There are no network calls. GPS spoofing uses bundled Natural Earth GeoJSON data; device profiles ship inside the package.
 
 **Does DMS modify my original files?**
-By default, no. DMS writes a new copy (e.g. `photo_cleaned.jpg`). In-place edits require an explicit flag.
+No. DMS always writes a new copy (e.g. `photo_cleaned.jpg` or `photo_spoofed.jpg`) and leaves your original untouched.
 
 **Which formats are supported?**
 JPEG, PNG, HEIC, TIFF, WebP, RAW, PDF, DOCX, MP4, MOV, and others. ExifTool is recommended for full coverage; without it, DMS falls back to Pillow and built-in readers for JPG / PNG / PDF / DOCX.

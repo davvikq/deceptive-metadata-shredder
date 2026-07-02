@@ -18,7 +18,7 @@ from pypdf import PdfReader
 from dms.config import get_exiftool_path, get_exiftool_version, require_exiftool
 from dms.core.constants import ALWAYS_DELETE_PREFIXES, ALWAYS_DELETE_TAGS, SENSITIVE_EXACT_TAGS, SENSITIVE_KEYWORDS, SENSITIVE_PARTIAL_TAGS, TECHNICAL_TAGS
 from dms.core.models import FileReport, MetaField
-from dms.core.utils import get_subprocess_flags
+from dms.core.utils import EXIFTOOL_TIMEOUT, get_subprocess_flags
 
 SUPPORTED_FORMATS = {
     ".jpg": "jpeg",
@@ -155,6 +155,7 @@ def _run_exiftool_json(path: Path) -> dict[str, Any]:
         check=True,
         capture_output=True,
         text=True,
+        timeout=EXIFTOOL_TIMEOUT,
         creationflags=get_subprocess_flags(),
     )
     payload = json.loads(result.stdout)
@@ -168,6 +169,7 @@ def _run_exiftool_pdf_json(path: Path) -> dict[str, Any]:
         check=True,
         capture_output=True,
         text=True,
+        timeout=EXIFTOOL_TIMEOUT,
         creationflags=get_subprocess_flags(),
     )
     payload = json.loads(result.stdout)
@@ -179,12 +181,16 @@ def _extract_thumbnail(path: Path) -> bytes | None:
         exiftool = find_exiftool()
     except FileNotFoundError:
         return None
-    result = subprocess.run(
-        [exiftool, "-b", "-ThumbnailImage", str(path)],
-        check=False,
-        capture_output=True,
-        creationflags=get_subprocess_flags(),
-    )
+    try:
+        result = subprocess.run(
+            [exiftool, "-b", "-ThumbnailImage", str(path)],
+            check=False,
+            capture_output=True,
+            timeout=EXIFTOOL_TIMEOUT,
+            creationflags=get_subprocess_flags(),
+        )
+    except subprocess.SubprocessError:
+        return None
     return result.stdout or None
 
 
@@ -227,15 +233,29 @@ def _safe_append(
 def _analyze_with_exiftool(path: Path) -> list[MetaField]:
     raw = _run_exiftool_json(path)
     fields: list[MetaField] = []
-    seen_keys: set[str] = set()
+    seen_keys: dict[str, set[str]] = {}
     _append_grouped_fields(fields, raw, seen_keys, file_type=detect_file_type(path))
     return fields
+
+
+def _is_duplicate_field(normalized_key: str, value: Any, seen_tags: dict[str, set[str]]) -> bool:
+    seen_values = seen_tags.get(normalized_key)
+    if seen_values is None:
+        seen_tags[normalized_key] = {str(value)}
+        return False
+    if not _is_sensitive_key(normalized_key):
+        return True
+    value_repr = str(value)
+    if value_repr in seen_values:
+        return True
+    seen_values.add(value_repr)
+    return False
 
 
 def _append_grouped_fields(
     fields: list[MetaField],
     payload: dict[str, Any],
-    seen_tags: set[str],
+    seen_tags: dict[str, set[str]],
     parents: tuple[str, ...] = (),
     file_type: str | None = None,
 ) -> None:
@@ -243,9 +263,8 @@ def _append_grouped_fields(
         if isinstance(value, dict) and "val" in value:
             field_tag = ".".join((*parents, key)) if parents else key
             normalized_key = _normalized_tag_name(field_tag)
-            if normalized_key in seen_tags:
+            if _is_duplicate_field(normalized_key, value.get("val"), seen_tags):
                 continue
-            seen_tags.add(normalized_key)
             _safe_append(fields, field_tag, value.get("val"), label_override=value.get("desc"), file_type=file_type)
             continue
 
@@ -255,9 +274,8 @@ def _append_grouped_fields(
 
         field_tag = ".".join((*parents, key)) if parents else key
         normalized_key = _normalized_tag_name(field_tag)
-        if normalized_key in seen_tags:
+        if _is_duplicate_field(normalized_key, value, seen_tags):
             continue
-        seen_tags.add(normalized_key)
         _safe_append(fields, field_tag, value, file_type=file_type)
 
 
@@ -396,7 +414,7 @@ def _rational_to_degrees(rational: Any) -> float | None:
 def _analyze_pdf(path: Path) -> list[MetaField]:
     fields: list[MetaField] = []
     if get_exiftool_path():
-        seen_keys: set[str] = set()
+        seen_keys: dict[str, set[str]] = {}
         _append_grouped_fields(fields, _run_exiftool_json(path), seen_keys)
         _append_grouped_fields(fields, _run_exiftool_pdf_json(path), seen_keys)
     # Keep binary stream open while PdfReader reads metadata (avoids lingering FDs on some backends).
@@ -465,6 +483,7 @@ def _read_exiftool_version(exiftool_path: str) -> float | None:
             capture_output=True,
             text=True,
             check=True,
+            timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
         )
         return float(result.stdout.strip())
@@ -516,6 +535,25 @@ def _build_report(
 def _append_warning_once(warnings: list[str], message: str) -> None:
     if message not in warnings:
         warnings.append(message)
+
+
+FILESYSTEM_DATE_KEYS: frozenset[str] = frozenset({"FileModifyDate", "FileAccessDate", "FileCreateDate"})
+
+
+def residual_sensitive_fields(report: FileReport) -> list[MetaField]:
+    """Sensitive, removable fields still present in *report* (excludes OS timestamps)."""
+
+    return [
+        field
+        for field in report.fields
+        if field.is_sensitive and not field.is_computed and field.key not in FILESYSTEM_DATE_KEYS
+    ]
+
+
+def verify(path: Path) -> list[MetaField]:
+    """Re-read *path* and return the sensitive fields that survived sanitisation."""
+
+    return residual_sensitive_fields(analyze(path))
 
 
 def analyze(path: Path) -> FileReport:

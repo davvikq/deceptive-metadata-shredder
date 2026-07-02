@@ -17,18 +17,18 @@ from dms.core.constants import (
     ALWAYS_DELETE_PREFIXES,
     ALWAYS_DELETE_TAGS,
     DATE_FIELD_KEYS,
-    DATE_TAGS_TO_SPOOF,
     DEVICE_TAGS_TO_CLEAR,
     GPS_TAGS_TO_SPOOF,
-    OFFSET_TAGS,
     REGION_XMP_NUKE_ARGS,
     SUBSEC_TAGS,
-    TIMEZONE_OFFSETS,
 )
 from dms.core.device_db import get_all_devices, get_models_by_make, get_random_device
+from dms.core.exiftool_tags import validate_exif_tag
 from dms.core.models import FileReport, MetaField, SpoofProfile, parse_metadata_datetime
 from dms.core.sanitizer import repack_docx_zip_dates, resolve_spoof_destination, run_atomic_file_update
-from dms.core.utils import get_subprocess_flags, remove_exiftool_signature
+from dms.core.utils import EXIFTOOL_TIMEOUT, get_subprocess_flags, remove_exiftool_signature
+
+_PROFILE_CREATOR_POOL = ("MSFT", "GOOG", "ADBE", "SUNW")
 
 def _is_always_delete_field(field: "MetaField") -> bool:
     normalized = field.key.split(":")[-1].split(".")[-1]
@@ -46,6 +46,12 @@ def _is_region_field(field: "MetaField") -> bool:
         if normalized.startswith(prefix):
             return True
     return False
+
+
+def _spoofed_profile_creator(current: object | None) -> str:
+    current_sig = str(current or "").strip().lower()
+    candidates = [sig for sig in _PROFILE_CREATOR_POOL if sig.lower() != current_sig]
+    return random.choice(candidates or list(_PROFILE_CREATOR_POOL))
 
 
 def _nuke_always_delete_tags(destination: Path, file_report: "FileReport") -> tuple[bool, bool]:
@@ -70,6 +76,7 @@ def _nuke_always_delete_tags(destination: Path, file_report: "FileReport") -> tu
         logging.debug("Nuking Region XMP blocks: %s", REGION_XMP_NUKE_ARGS)
         result = subprocess.run(
             args, capture_output=True, text=True,
+            timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
         )
         if result.returncode != 0:
@@ -143,16 +150,6 @@ def _find_field(report: FileReport, needle: str) -> MetaField | None:
 
 def _format_datetime(value: datetime) -> str:
     return value.strftime("%Y:%m:%d %H:%M:%S")
-
-
-def _format_for_tag(tag: str, value: datetime) -> str:
-    if tag in {"DateCreated", "GPSDateStamp"}:
-        return value.strftime("%Y:%m:%d")
-    if tag in {"TimeCreated", "GPSTimeStamp"}:
-        return value.strftime("%H:%M:%S")
-    if tag in {"SubSecTimeOriginal", "SubSecTimeDigitized"}:
-        return "000"
-    return _format_datetime(value)
 
 
 def get_writable_date_tags(file_type: str) -> list[str]:
@@ -243,6 +240,7 @@ def _clear_offset_tags(destination: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        timeout=EXIFTOOL_TIMEOUT,
         creationflags=get_subprocess_flags(),
     )
 
@@ -265,17 +263,13 @@ def _apply_heic_dates(destination: Path, report: FileReport, value: datetime | N
     for tag in heic_date_tags:
         args.append(f"-{tag}=" if remove else f"-{tag}={date_str}")
 
-    fake_offset = random.choice(TIMEZONE_OFFSETS)
     fake_subsec = str(random.randint(0, 999)).zfill(3)
-    for tag in OFFSET_TAGS:
-        if _field_exists(report, tag.lower()):
-            args.append(f"-{tag}=" if remove else f"-{tag}={fake_offset}")
     for tag in SUBSEC_TAGS:
         if _field_exists(report, tag.lower()):
             args.append(f"-{tag}=" if remove else f"-{tag}={fake_subsec}")
 
     args.append(str(destination))
-    result = subprocess.run(args, capture_output=True, text=True, creationflags=get_subprocess_flags())
+    result = subprocess.run(args, capture_output=True, text=True, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags())
     if "0 image files updated" in (result.stdout or ""):
         logging.error("HEIC date write: 0 files updated, stderr=%s", (result.stderr or "").strip())
         raise PermissionError("No date fields could be written")
@@ -306,17 +300,13 @@ def _apply_dates_to_destination(destination: Path, report: FileReport, value: da
     for tag in write_tags:
         args.append(f"-{tag}=" if remove else f"-{tag}={_format_grouped_date(tag, value or datetime.now(timezone.utc).replace(tzinfo=None))}")
 
-    fake_offset = random.choice(TIMEZONE_OFFSETS)
     fake_subsec = str(random.randint(0, 999)).zfill(3)
-    for tag in OFFSET_TAGS:
-        if _field_exists(report, tag.lower()):
-            args.append(f"-{tag}=" if remove else f"-{tag}={fake_offset}")
     for tag in SUBSEC_TAGS:
         if _field_exists(report, tag.lower()):
             args.append(f"-{tag}=" if remove else f"-{tag}={fake_subsec}")
 
     args.append(str(destination))
-    result = subprocess.run(args, capture_output=True, text=True, creationflags=get_subprocess_flags())
+    result = subprocess.run(args, capture_output=True, text=True, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags())
     if "0 image files updated" in (result.stdout or ""):
         raise PermissionError("No date fields could be written")
     if result.returncode != 0:
@@ -345,16 +335,28 @@ def _resolve_date_value(report: FileReport, payload: dict[str, object] | None = 
     return (min(present) if present else datetime.now(timezone.utc).replace(tzinfo=None)), False
 
 
+def _safe_tag(tag: str) -> str | None:
+    try:
+        return validate_exif_tag(tag)
+    except ValueError:
+        logging.warning("Skipping metadata tag with unexpected characters: %r", tag)
+        return None
+
+
 def _run_exiftool_edits(destination: Path, clears: list[str], writes: dict[str, object], *, soft_fail: bool = False) -> bool:
     if not clears and not writes:
         return True
+    safe_clears = [safe for tag in clears if (safe := _safe_tag(tag)) is not None]
+    safe_writes = {safe: value for tag, value in writes.items() if (safe := _safe_tag(tag)) is not None}
+    if not safe_clears and not safe_writes:
+        return True
     exiftool_path = require_exiftool()
     args = [exiftool_path]
-    args.extend(f"-{tag}=" for tag in clears)
-    for tag, value in writes.items():
+    args.extend(f"-{tag}=" for tag in safe_clears)
+    for tag, value in safe_writes.items():
         args.append(f"-{tag}={value}")
     args.extend(["-overwrite_original", str(destination)])
-    result = subprocess.run(args, capture_output=True, text=True, creationflags=get_subprocess_flags())
+    result = subprocess.run(args, capture_output=True, text=True, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags())
     if result.returncode != 0:
         message = result.stderr.strip() or "Failed to apply metadata update."
         logging.error("exiftool failed: %s", message)
@@ -382,48 +384,12 @@ def _raw_sensitive_updates(report: FileReport) -> dict[str, str]:
     return updates
 
 
-def _build_date_updates(report: FileReport, profile: SpoofProfile) -> dict[str, str]:
-    updates: dict[str, str] = {}
-    if profile.dates_mode == "keep":
-        return updates
-    existing_date_keys = {field.key for field in report.fields if field.category == "dates" or field.key in DATE_FIELD_KEYS}
-    relevant_tags = [key for key in DATE_TAGS_TO_SPOOF if key in existing_date_keys or _field_exists(report, key.lower())]
-
-    if profile.dates_mode == "remove":
-        return {key: "" for key in relevant_tags}
-
-    present = [
-        parse_metadata_datetime(field.value)
-        for field in report.fields
-        if field.key in DATE_FIELD_KEYS and parse_metadata_datetime(field.value) is not None
-    ]
-    base_date = min(present) if present else datetime.now(timezone.utc).replace(tzinfo=None)
+def _resolve_spoof_anchor_date(report: FileReport, profile: SpoofProfile) -> datetime:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     if profile.dates_mode == "random":
-        anchor = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=random.randint(30, 2000))
-        for key in relevant_tags:
-            updates[key] = _format_for_tag(key, anchor)
-        fake_offset = random.choice(TIMEZONE_OFFSETS)
-        fake_subsec = str(random.randint(0, 999)).zfill(3)
-        for tag in OFFSET_TAGS:
-            if _field_exists(report, tag.lower()):
-                updates[tag] = fake_offset
-        for tag in SUBSEC_TAGS:
-            if _field_exists(report, tag.lower()):
-                updates[tag] = fake_subsec
-        return updates
-
-    anchor = base_date + timedelta(days=profile.dates_shift_days)
-    for key in relevant_tags:
-        updates[key] = _format_for_tag(key, anchor)
-    fake_offset = random.choice(TIMEZONE_OFFSETS)
-    fake_subsec = str(random.randint(0, 999)).zfill(3)
-    for tag in OFFSET_TAGS:
-        if _field_exists(report, tag.lower()):
-            updates[tag] = fake_offset
-    for tag in SUBSEC_TAGS:
-        if _field_exists(report, tag.lower()):
-            updates[tag] = fake_subsec
-    return updates
+        return now - timedelta(days=random.randint(30, 2000))
+    base_date = _resolve_date_value(report)[0] or now
+    return base_date + timedelta(days=profile.dates_shift_days)
 
 
 def _resolve_gps_target(report: FileReport, profile: SpoofProfile) -> tuple[float, float] | None:
@@ -545,6 +511,7 @@ def _set_filesystem_dates(destination: Path, fake_date: datetime, exiftool_path:
             ],
             capture_output=True,
             check=False,
+            timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
         )
     except Exception as exc:  # pragma: no cover - filesystem edge cases
@@ -673,7 +640,7 @@ def apply_field_spoof(
             }
             existing_profile_creator = _get_field_value(file_report, "ProfileCreator")
             if str(existing_profile_creator).lower() == "appl" and "ProfileCreator" not in writes:
-                writes["ProfileCreator"] = "MSFT"
+                writes["ProfileCreator"] = _spoofed_profile_creator(existing_profile_creator)
         elif field.category == "dates":
             payload = dict(new_value) if isinstance(new_value, dict) else None
             resolved_date, remove = _resolve_date_value(file_report, payload)
@@ -743,7 +710,7 @@ def apply_spoof(
             writes.update(device_updates)
             existing_profile_creator = _get_field_value(file_report, "ProfileCreator")
             if str(existing_profile_creator).lower() == "appl" and "ProfileCreator" not in writes:
-                writes["ProfileCreator"] = "MSFT"
+                writes["ProfileCreator"] = _spoofed_profile_creator(existing_profile_creator)
 
         if file_report.file_type.lower() != "docx":
             writes.update(_author_updates(profile, file_report))
@@ -761,12 +728,10 @@ def apply_spoof(
                 _apply_dates_to_destination(destination, file_report, None, remove=True)
                 fs_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=random.randint(180, 2000))
             else:
-                date_updates = _build_date_updates(file_report, profile)
-                anchor = parse_metadata_datetime(next(iter(date_updates.values()), None)) if date_updates else None
-                resolved = anchor or _resolve_date_value(file_report)[0]
-                if resolved is not None and not _apply_dates_to_destination(destination, file_report, resolved, remove=False):
+                anchor = _resolve_spoof_anchor_date(file_report, profile)
+                if not _apply_dates_to_destination(destination, file_report, anchor, remove=False):
                     raise RuntimeError("Failed to update date metadata.")
-                fs_date = resolved
+                fs_date = anchor
 
         remove_exiftool_signature(destination, exiftool_path)
         if fs_date is not None:
@@ -870,7 +835,7 @@ def apply_smart_spoof(
                 if device_updates:
                     existing_profile_creator = _get_field_value(file_report, "ProfileCreator")
                     if str(existing_profile_creator).lower() == "appl" and "ProfileCreator" not in device_updates:
-                        device_updates["ProfileCreator"] = "MSFT"
+                        device_updates["ProfileCreator"] = _spoofed_profile_creator(existing_profile_creator)
                     if _run_exiftool_edits(destination, list(DEVICE_TAGS_TO_CLEAR), device_updates, soft_fail=True):
                         changes.append("device")
                     else:

@@ -12,6 +12,21 @@ from dms.config import DATA_DIR
 
 NEUTRAL_WATERS = (0.0, -160.0)
 
+_OCEAN_ANCHORS = (
+    (0.0, -160.0),
+    (30.0, -140.0),
+    (-20.0, -110.0),
+    (-45.0, -125.0),
+    (25.0, -40.0),
+    (-35.0, -15.0),
+    (-20.0, 80.0),
+    (-45.0, 75.0),
+)
+
+
+def _random_ocean_point() -> tuple[float, float]:
+    return random.choice(_OCEAN_ANCHORS)
+
 
 @lru_cache(maxsize=1)
 def _load_features() -> list[dict]:
@@ -82,7 +97,7 @@ def smart_spoof(lat: float, lon: float) -> tuple[float, float]:
 
     country = get_country(lat, lon)
     base_lat, base_lon = (
-        get_random_point_in_country(country) if country != "ZZ" else NEUTRAL_WATERS
+        get_random_point_in_country(country) if country != "ZZ" else _random_ocean_point()
     )
     jittered = (base_lat + random.uniform(-0.001, 0.001), base_lon + random.uniform(-0.001, 0.001))
     spoof_country = get_country(*jittered)

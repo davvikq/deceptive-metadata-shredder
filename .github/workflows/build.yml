@@ -10,8 +10,6 @@ permissions:
 
 jobs:
   build:
-    env:
-      EXIFTOOL_VERSION: "13.58"
     strategy:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
@@ -38,23 +36,19 @@ jobs:
       - name: Download exiftool (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
+        env:
+          EXIFTOOL_VERSION: "13.59"
+          EXIFTOOL_SHA256: "44b512b25af500724ba579d0a53c8fc5851628b692dd5e5d94ae4a15c2cba9ec"
         run: |
           $zipName = "exiftool-$env:EXIFTOOL_VERSION`_64.zip"
-          $downloadUrl = "https://exiftool.org/$zipName"
+          $downloadUrl = "https://sourceforge.net/projects/exiftool/files/$zipName/download"
           New-Item -ItemType Directory -Force -Path bin | Out-Null
           if (Test-Path "bin/exiftool.exe") { Remove-Item "bin/exiftool.exe" -Force }
           if (Test-Path "bin/exiftool_files") { Remove-Item "bin/exiftool_files" -Recurse -Force }
-          curl -L $downloadUrl -o exiftool.zip
-          $checksums = Invoke-WebRequest -Uri "https://exiftool.org/checksums.txt" -UseBasicParsing
-          $pattern = "SHA2-256\(" + [regex]::Escape($zipName) + "\)=\s*([0-9a-fA-F]{64})"
-          $match = [regex]::Match($checksums.Content, $pattern)
-          if (-not $match.Success) {
-            throw "Could not find SHA256 for $zipName in checksums.txt"
-          }
-          $expectedSha256 = $match.Groups[1].Value.ToLowerInvariant()
+          curl -L --retry 3 --retry-delay 5 $downloadUrl -o exiftool.zip
           $actualSha256 = (Get-FileHash exiftool.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $expectedSha256) {
-            throw "Checksum mismatch for $zipName. expected=$expectedSha256 actual=$actualSha256"
+          if ($actualSha256 -ne "$env:EXIFTOOL_SHA256") {
+            throw "Checksum mismatch for $zipName. expected=$env:EXIFTOOL_SHA256 actual=$actualSha256"
           }
           Expand-Archive exiftool.zip -DestinationPath bin/exiftool_download -Force
           $packageRoot = Get-ChildItem bin/exiftool_download | Where-Object { $_.PSIsContainer } | Select-Object -First 1

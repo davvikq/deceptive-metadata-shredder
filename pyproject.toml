@@ -4,12 +4,28 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deceptive-metadata-shredder"
-version = "1.0.0"
+version = "1.0.4"
 description = "Offline desktop app for metadata inspection, removal, and spoofing."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "davvik (GitHub: davvikq)" }]
+keywords = ["metadata", "exif", "privacy", "gps", "spoofing", "exiftool", "anonymization", "osint"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Environment :: X11 Applications :: Qt",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: Multimedia :: Graphics",
+  "Topic :: Utilities",
+]
 dependencies = [
   "PySide6>=6.6.0",
   "Pillow>=10.0.0",
@@ -25,6 +41,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/davvikq/deceptive-metadata-shredder"
+Repository = "https://github.com/davvikq/deceptive-metadata-shredder"
+Releases = "https://github.com/davvikq/deceptive-metadata-shredder/releases"
 
 [project.scripts]
 dms = "dms.interfaces.cli:app"

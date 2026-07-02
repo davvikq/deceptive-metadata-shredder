@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from pathlib import Path
 
+import piexif
 from docx import Document
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
@@ -19,7 +20,7 @@ from pypdf import PdfReader, PdfWriter
 from dms.config import require_exiftool
 from dms.core.exiftool_tags import validate_exif_tag
 from dms.core.models import FileReport
-from dms.core.utils import get_subprocess_flags, remove_exiftool_signature
+from dms.core.utils import EXIFTOOL_TIMEOUT, get_subprocess_flags, remove_exiftool_signature
 
 INTERRUPT_LOG = "Process interrupted. Original file %s remains unchanged."
 
@@ -127,6 +128,7 @@ def _sanitize_with_exiftool(destination: Path) -> None:
         check=True,
         capture_output=True,
         text=True,
+        timeout=EXIFTOOL_TIMEOUT,
         creationflags=get_subprocess_flags(),
     )
 
@@ -155,6 +157,7 @@ def remove_field(
             ],
             capture_output=True,
             text=True,
+            timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
         )
         stderr = (result.stderr or "").strip()
@@ -182,6 +185,16 @@ def remove_field(
 
 
 def _sanitize_image_without_exiftool(destination: Path) -> None:
+    if destination.suffix.lower() in {".jpg", ".jpeg"}:
+        try:
+            piexif.remove(str(destination))
+            return
+        except Exception as exc:
+            logging.warning(
+                "piexif EXIF removal failed for %s (%s); falling back to Pillow re-encode",
+                destination.name,
+                exc,
+            )
     with Image.open(destination) as image:
         clean = image.copy()
         clean.info.pop("exif", None)

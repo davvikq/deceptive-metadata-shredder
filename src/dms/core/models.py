@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,13 +64,19 @@ class Device:
     exif_overrides: dict[str, Any] = field(default_factory=dict)
 
 
+def _to_naive_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 def parse_metadata_datetime(value: Any) -> datetime | None:
     """Parse common EXIF and document datetime values."""
 
     if value in (None, ""):
         return None
     if isinstance(value, datetime):
-        return value
+        return _to_naive_utc(value)
     text = str(value).strip()
     formats = [
         "%Y:%m:%d %H:%M:%S",
@@ -82,10 +88,10 @@ def parse_metadata_datetime(value: Any) -> datetime | None:
     ]
     for fmt in formats:
         try:
-            return datetime.strptime(text, fmt)
+            return _to_naive_utc(datetime.strptime(text, fmt))
         except ValueError:
             continue
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return _to_naive_utc(datetime.fromisoformat(text.replace("Z", "+00:00")))
     except ValueError:
         return None
