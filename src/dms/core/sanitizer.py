@@ -14,8 +14,10 @@ from pathlib import Path
 
 import piexif
 from docx import Document
+from lxml import etree
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import NameObject
 
 from dms.config import require_exiftool
 from dms.core.exiftool_tags import validate_exif_tag
@@ -201,21 +203,36 @@ def _sanitize_image_without_exiftool(destination: Path) -> None:
         clean.save(destination)
 
 
-def _sanitize_pdf_without_exiftool(destination: Path) -> None:
-    reader = PdfReader(str(destination))
-    writer = PdfWriter()
-    for page in reader.pages:
-        writer.add_page(page)
-    writer.add_metadata({})
+def _sanitize_pdf(destination: Path) -> None:
+    """Rewrite a PDF while preserving document content and dropping authorship."""
+    # ExifTool updates PDFs incrementally: -all= can leave old /Info and XMP
+    # bytes in the file. Clone the full document into a fresh PDF so outlines,
+    # forms and attachments survive, then empty XMP streams before unlinking.
+    fd, rewritten_str = tempfile.mkstemp(prefix=".dms_pdf_", suffix=".pdf", dir=destination.parent)
+    rewritten = Path(rewritten_str)
     try:
-        writer.xmp_metadata = None
-    except AttributeError:
-        logging.warning(
-            "pypdf API changed (xmp_metadata); XMP metadata may not be fully removed from %s",
-            destination.name,
-        )
-    with destination.open("wb") as handle:
-        writer.write(handle)
+        with os.fdopen(fd, "wb") as output, destination.open("rb") as source:
+            reader = PdfReader(source)
+            writer = PdfWriter()
+            writer.clone_document_from_reader(reader)
+            writer.metadata = None
+            writer.xmp_metadata = b""
+            writer.xmp_metadata = None
+            for page in writer.pages:
+                page_metadata = page.get("/Metadata")
+                if page_metadata is not None:
+                    page_metadata.get_object().set_data(b"")
+                    del page[NameObject("/Metadata")]
+                for reference in page.get("/Annots", []):
+                    annotation = reference.get_object()
+                    if annotation.get("/Subtype") != "/Widget":
+                        annotation.pop(NameObject("/T"), None)
+                        annotation.pop(NameObject("/M"), None)
+                        annotation.pop(NameObject("/CreationDate"), None)
+            writer.write(output)
+        os.replace(rewritten, destination)
+    finally:
+        rewritten.unlink(missing_ok=True)
 
 
 def _strip_docx_tracked_changes(document_xml: Path) -> None:
@@ -244,7 +261,8 @@ def _strip_docx_tracked_changes(document_xml: Path) -> None:
     document_xml.write_text(ET.tostring(root, encoding="unicode"), encoding="utf-8")
 
 
-def _sanitize_docx_without_exiftool(destination: Path) -> None:
+def _sanitize_docx(destination: Path) -> None:
+    """Clear OOXML properties and revision/comment attribution."""
     document = Document(str(destination))
     props = document.core_properties
     props.author = ""
@@ -266,6 +284,27 @@ def _sanitize_docx_without_exiftool(destination: Path) -> None:
         document_xml = extract_root / "word" / "document.xml"
         if document_xml.exists():
             _strip_docx_tracked_changes(document_xml)
+
+        # Document properties and revision/comment authors live in different
+        # OOXML parts. Clearing only python-docx core_properties misses them.
+        for properties_name in ("core.xml", "custom.xml", "app.xml"):
+            properties_xml = extract_root / "docProps" / properties_name
+            if properties_xml.exists():
+                tree = etree.parse(str(properties_xml), parser=etree.XMLParser(resolve_entities=False, no_network=True))
+                tree.getroot().clear()
+                tree.write(str(properties_xml), encoding="UTF-8", xml_declaration=True)
+
+        word_root = extract_root / "word"
+        for xml_path in word_root.rglob("*.xml"):
+            tree = etree.parse(str(xml_path), parser=etree.XMLParser(resolve_entities=False, no_network=True))
+            changed = False
+            for element in tree.iter():
+                for attribute in list(element.attrib):
+                    if etree.QName(attribute).localname.lower() in {"author", "initials", "userid", "providerid", "email"}:
+                        del element.attrib[attribute]
+                        changed = True
+            if changed:
+                tree.write(str(xml_path), encoding="UTF-8", xml_declaration=True)
 
         with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
             for item in extract_root.rglob("*"):
@@ -310,6 +349,12 @@ def remove_all(
     suffix = source.suffix.lower()
 
     def mutate(staging: Path) -> None:
+        if suffix == ".pdf":
+            _sanitize_pdf(staging)
+            return
+        if suffix == ".docx":
+            _sanitize_docx(staging)
+            return
         try:
             _sanitize_with_exiftool(staging)
         except (RuntimeError, subprocess.SubprocessError) as exc:
@@ -318,20 +363,6 @@ def remove_all(
                 _sanitize_image_without_exiftool(staging)
                 logging.info(
                     "Fallback sanitization (Pillow) used for %s — verify metadata was fully removed",
-                    staging.name,
-                )
-                return
-            if suffix == ".pdf":
-                _sanitize_pdf_without_exiftool(staging)
-                logging.info(
-                    "Fallback sanitization (pypdf) used for %s — verify metadata was fully removed",
-                    staging.name,
-                )
-                return
-            if suffix == ".docx":
-                _sanitize_docx_without_exiftool(staging)
-                logging.info(
-                    "Fallback sanitization (python-docx) used for %s — verify metadata was fully removed",
                     staging.name,
                 )
                 return
