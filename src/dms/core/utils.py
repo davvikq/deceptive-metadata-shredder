@@ -9,6 +9,10 @@ from pathlib import Path
 
 EXIFTOOL_TIMEOUT = 120
 
+# ExifTool writes UTF-8. text=True alone decodes with the OS locale (e.g. cp1251
+# on Windows), which crashes the reader thread on bytes such as 0x98 (☀).
+EXIFTOOL_TEXT_KWARGS = {"text": True, "encoding": "utf-8", "errors": "replace"}
+
 
 def get_subprocess_flags() -> int:
     """Return creation flags that hide console windows on Windows."""

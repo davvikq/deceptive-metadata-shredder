@@ -18,7 +18,7 @@ from pypdf import PdfReader
 from dms.config import get_exiftool_path, get_exiftool_version, require_exiftool
 from dms.core.constants import ALWAYS_DELETE_PREFIXES, ALWAYS_DELETE_TAGS, SENSITIVE_EXACT_TAGS, SENSITIVE_KEYWORDS, SENSITIVE_PARTIAL_TAGS, TECHNICAL_TAGS
 from dms.core.models import FileReport, MetaField
-from dms.core.utils import EXIFTOOL_TIMEOUT, get_subprocess_flags
+from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags
 
 SUPPORTED_FORMATS = {
     ".jpg": "jpeg",
@@ -57,6 +57,12 @@ RAW_SUFFIXES = {suffix for suffix, kind in SUPPORTED_FORMATS.items() if kind == 
 RAW_READONLY_TAGS = {"InternalSerialNumber"}
 IMAGE_PARSE_WARNING = "Image metadata could not be fully parsed. Showing limited report."
 IMAGE_THUMBNAIL_WARNING = "Could not render image preview thumbnail."
+ANALYSIS_LIMITED_WARNING = "Metadata analysis is limited; verification cannot guarantee this file is clean."
+ZERO_DATE_PREFIXES = ("0000:00:00", "0000-00-00")
+
+
+class MetadataAnalysisError(RuntimeError):
+    """Raised when metadata could not be read completely enough to verify a file."""
 
 FIELD_DEFINITIONS: dict[str, tuple[str, str, bool]] = {
     "GPSLatitude": ("GPS Latitude", "gps", True),
@@ -151,29 +157,43 @@ def detect_file_type(path: Path) -> str:
 def _run_exiftool_json(path: Path) -> dict[str, Any]:
     exiftool = find_exiftool()
     result = subprocess.run(
-        [exiftool, "-json", "-n", "-a", "-u", "-G1", "-l", str(path)],
+        [exiftool, "-json", "-n", "-a", "-u", "-G1", "-l", "-charset", "filename=UTF8", str(path)],
         check=True,
         capture_output=True,
-        text=True,
         timeout=EXIFTOOL_TIMEOUT,
         creationflags=get_subprocess_flags(),
+        **EXIFTOOL_TEXT_KWARGS,
     )
-    payload = json.loads(result.stdout)
-    return payload[0] if payload else {}
+    if not (result.stdout or "").strip():
+        raise MetadataAnalysisError("exiftool returned no metadata output.")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise MetadataAnalysisError(f"exiftool returned invalid JSON: {exc}") from exc
+    if not payload or not payload[0]:
+        raise MetadataAnalysisError("exiftool returned an empty metadata report.")
+    return payload[0]
 
 
 def _run_exiftool_pdf_json(path: Path) -> dict[str, Any]:
     exiftool = find_exiftool()
     result = subprocess.run(
-        [exiftool, "-json", "-pdf:all", "-xmp:all", str(path)],
+        [exiftool, "-json", "-pdf:all", "-xmp:all", "-charset", "filename=UTF8", str(path)],
         check=True,
         capture_output=True,
-        text=True,
         timeout=EXIFTOOL_TIMEOUT,
         creationflags=get_subprocess_flags(),
+        **EXIFTOOL_TEXT_KWARGS,
     )
-    payload = json.loads(result.stdout)
-    return payload[0] if payload else {}
+    if not (result.stdout or "").strip():
+        raise MetadataAnalysisError("exiftool returned no PDF metadata output.")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise MetadataAnalysisError(f"exiftool returned invalid PDF JSON: {exc}") from exc
+    if not payload or not payload[0]:
+        raise MetadataAnalysisError("exiftool returned an empty PDF metadata report.")
+    return payload[0]
 
 
 def _extract_thumbnail(path: Path) -> bytes | None:
@@ -194,6 +214,11 @@ def _extract_thumbnail(path: Path) -> bytes | None:
     return result.stdout or None
 
 
+def _is_zero_datetime(value: Any) -> bool:
+    text = str(value).strip() if value is not None else ""
+    return text.startswith(ZERO_DATE_PREFIXES)
+
+
 def _safe_append(
     fields: list[MetaField],
     exiftool_tag: str,
@@ -209,7 +234,12 @@ def _safe_append(
         normalized_key,
         (label_override or normalized_key.replace("_", " "), "other", False),
     )
-    is_sensitive = _is_sensitive_key(normalized_key)
+    is_sensitive = (
+        _is_sensitive_key(normalized_key)
+        and not _is_zero_datetime(value)
+        and not exiftool_tag.upper().startswith("ZIP:")
+        and normalized_key not in {"ZipModifyDate", "ZipCreateDate"}
+    )
     fields.append(
         MetaField(
             exiftool_tag=exiftool_tag,
@@ -411,12 +441,22 @@ def _rational_to_degrees(rational: Any) -> float | None:
     return round(degrees + minutes / 60 + seconds / 3600, 6)
 
 
-def _analyze_pdf(path: Path) -> list[MetaField]:
+def _analyze_pdf(path: Path) -> tuple[list[MetaField], str, str | None]:
     fields: list[MetaField] = []
+    status = "ok"
+    error: str | None = None
     if get_exiftool_path():
         seen_keys: dict[str, set[str]] = {}
-        _append_grouped_fields(fields, _run_exiftool_json(path), seen_keys)
-        _append_grouped_fields(fields, _run_exiftool_pdf_json(path), seen_keys)
+        try:
+            _append_grouped_fields(fields, _run_exiftool_json(path), seen_keys)
+            _append_grouped_fields(fields, _run_exiftool_pdf_json(path), seen_keys)
+        except (RuntimeError, subprocess.SubprocessError, OSError, json.JSONDecodeError, MetadataAnalysisError) as exc:
+            status = "partial"
+            error = f"exiftool PDF read failed: {exc}"
+            logging.warning("exiftool PDF read failed for %s: %s", path, exc)
+    else:
+        status = "partial"
+        error = "exiftool not found; PDF analysis is limited."
     # Keep binary stream open while PdfReader reads metadata (avoids lingering FDs on some backends).
     with path.open("rb") as stream:
         reader = PdfReader(stream)
@@ -439,11 +479,23 @@ def _analyze_pdf(path: Path) -> list[MetaField]:
     for key, value in pdf_extras.items():
         if not any(field.key == key for field in fields):
             _safe_append(fields, key, value)
-    return fields
+    return fields, status, error
 
 
-def _analyze_docx(path: Path) -> list[MetaField]:
-    fields = _analyze_with_exiftool(path) if get_exiftool_path() else []
+def _analyze_docx(path: Path) -> tuple[list[MetaField], str, str | None]:
+    fields: list[MetaField] = []
+    status = "ok"
+    error: str | None = None
+    if get_exiftool_path():
+        try:
+            fields = _analyze_with_exiftool(path)
+        except (RuntimeError, subprocess.SubprocessError, OSError, json.JSONDecodeError, MetadataAnalysisError) as exc:
+            status = "partial"
+            error = f"exiftool DOCX read failed: {exc}"
+            logging.warning("exiftool DOCX read failed for %s: %s", path, exc)
+    else:
+        status = "partial"
+        error = "exiftool not found; DOCX analysis is limited."
     # Load from memory so python-docx does not hold an open file handle to path.
     document = Document(io.BytesIO(path.read_bytes()))
     props = document.core_properties
@@ -464,7 +516,7 @@ def _analyze_docx(path: Path) -> list[MetaField]:
             has_tracked_changes = "<w:ins" in content or "<w:del" in content
     if not any(field.key == "HasTrackedChanges" for field in fields):
         _safe_append(fields, "HasTrackedChanges", has_tracked_changes)
-    return fields
+    return fields, status, error
 
 
 def _version_number(version: str | None) -> float | None:
@@ -481,10 +533,10 @@ def _read_exiftool_version(exiftool_path: str) -> float | None:
         result = subprocess.run(
             [exiftool_path, "-ver"],
             capture_output=True,
-            text=True,
             check=True,
             timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
+            **EXIFTOOL_TEXT_KWARGS,
         )
         return float(result.stdout.strip())
     except (subprocess.SubprocessError, ValueError):
@@ -514,6 +566,9 @@ def _build_report(
     fields: list[MetaField],
     thumbnail: bytes | None,
     warnings: list[str],
+    *,
+    analysis_status: str = "ok",
+    analysis_error: str | None = None,
 ) -> FileReport:
     empty_reason = None
     if not fields:
@@ -529,6 +584,8 @@ def _build_report(
         warnings=warnings,
         empty_reason=empty_reason,
         exiftool_version=get_exiftool_version(),
+        analysis_status=analysis_status,
+        analysis_error=analysis_error,
     )
 
 
@@ -551,9 +608,16 @@ def residual_sensitive_fields(report: FileReport) -> list[MetaField]:
 
 
 def verify(path: Path) -> list[MetaField]:
-    """Re-read *path* and return the sensitive fields that survived sanitisation."""
+    """Re-read *path* and return sensitive fields that survived sanitisation.
 
-    return residual_sensitive_fields(analyze(path))
+    Raises :class:`MetadataAnalysisError` when the file could not be read fully:
+    an unreadable file must never be reported as verified clean.
+    """
+
+    report = analyze(path)
+    if report.analysis_status != "ok":
+        raise MetadataAnalysisError(report.analysis_error or "Metadata could not be read completely.")
+    return residual_sensitive_fields(report)
 
 
 def analyze(path: Path) -> FileReport:
@@ -567,22 +631,41 @@ def analyze(path: Path) -> FileReport:
     suffix = file_path.suffix.lower()
     warnings = _report_warnings(file_path)
 
+    def report_with(
+        fields: list[MetaField],
+        thumbnail: bytes | None = None,
+        status: str = "ok",
+        error: str | None = None,
+    ) -> FileReport:
+        if status != "ok":
+            _append_warning_once(warnings, ANALYSIS_LIMITED_WARNING)
+        return _build_report(
+            file_path,
+            file_type,
+            fields,
+            thumbnail,
+            warnings,
+            analysis_status=status,
+            analysis_error=error,
+        )
+
     if suffix in IMAGE_SUFFIXES:
+        status = "ok"
+        error: str | None = None
         try:
-            if suffix in HEIC_SUFFIXES:
-                try:
-                    fields = _analyze_with_exiftool(file_path)
-                except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError):
-                    fields = []
-            else:
-                try:
-                    fields = _analyze_with_exiftool(file_path)
-                except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError):
-                    fields = _analyze_image_fallback(file_path)
-        except Exception:
-            logging.exception("Failed to analyze image: %s", file_path)
-            fields = []
-            _append_warning_once(warnings, IMAGE_PARSE_WARNING)
+            fields = _analyze_with_exiftool(file_path)
+        except Exception as exc:
+            logging.warning("exiftool image read failed for %s: %s", file_path, exc)
+            try:
+                fields = _analyze_image_fallback(file_path)
+                status = "partial"
+                error = f"exiftool read failed: {exc}"
+            except Exception:
+                logging.exception("Failed to analyze image: %s", file_path)
+                fields = []
+                status = "unverified"
+                error = f"Metadata could not be read: {exc}"
+                _append_warning_once(warnings, IMAGE_PARSE_WARNING)
 
         thumbnail = None
         try:
@@ -598,33 +681,35 @@ def analyze(path: Path) -> FileReport:
             logging.exception("Failed to build image thumbnail: %s", file_path)
             _append_warning_once(warnings, IMAGE_THUMBNAIL_WARNING)
 
-        return _build_report(file_path, file_type, fields, thumbnail, warnings)
+        return report_with(fields, thumbnail, status, error)
 
     if suffix in PDF_SUFFIXES:
         try:
-            fields = _analyze_pdf(file_path)
-        except Exception:
+            fields, status, error = _analyze_pdf(file_path)
+        except Exception as exc:
             logging.exception("Failed to analyze PDF: %s", file_path)
-            fields = []
-        return _build_report(file_path, file_type, fields, None, warnings)
+            fields, status, error = [], "unverified", f"Metadata could not be read: {exc}"
+        return report_with(fields, status=status, error=error)
 
     if suffix in DOC_SUFFIXES:
         try:
-            fields = _analyze_docx(file_path)
-        except Exception:
+            fields, status, error = _analyze_docx(file_path)
+        except Exception as exc:
             logging.exception("Failed to analyze DOCX: %s", file_path)
-            fields = []
-        return _build_report(file_path, file_type, fields, None, warnings)
+            fields, status, error = [], "unverified", f"Metadata could not be read: {exc}"
+        return report_with(fields, status=status, error=error)
 
     if suffix in VIDEO_SUFFIXES:
         try:
             fields = _analyze_with_exiftool(file_path)
-        except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
-            fields = []
-        return _build_report(file_path, file_type, fields, None, warnings)
+            return report_with(fields)
+        except Exception as exc:
+            logging.warning("exiftool video read failed for %s: %s", file_path, exc)
+            return report_with([], status="unverified", error=f"Metadata could not be read: {exc}")
 
     try:
         fields = _analyze_with_exiftool(file_path)
-    except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
-        fields = []
-    return _build_report(file_path, file_type, fields, None, warnings)
+        return report_with(fields)
+    except Exception as exc:
+        logging.warning("exiftool read failed for %s: %s", file_path, exc)
+        return report_with([], status="unverified", error=f"Metadata could not be read: {exc}")

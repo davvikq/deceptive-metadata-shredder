@@ -8,7 +8,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from dms.core.utils import EXIFTOOL_TIMEOUT, get_subprocess_flags
+from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags
 
 APP_NAME = "Deceptive Metadata Shredder"
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -22,9 +22,9 @@ def _is_working_exiftool(path: Path) -> bool:
             [str(path), "-ver"],
             check=True,
             capture_output=True,
-            text=True,
             timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
+            **EXIFTOOL_TEXT_KWARGS,
         )
     except (subprocess.SubprocessError, OSError):
         return False
@@ -81,9 +81,9 @@ def get_exiftool_version() -> str | None:
             [exiftool, "-ver"],
             check=True,
             capture_output=True,
-            text=True,
             timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
+            **EXIFTOOL_TEXT_KWARGS,
         )
     except (subprocess.SubprocessError, OSError):
         return None

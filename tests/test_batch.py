@@ -10,10 +10,12 @@ from dms.interfaces.gui.app import looks_like_dms_output
 runner = CliRunner()
 
 
-def _report(path: Path) -> FileReport:
+def _report(path: Path, *, status: str = "ok", error: str | None = None) -> FileReport:
     return FileReport(
         path=path,
         file_type="jpeg",
+        analysis_status=status,
+        analysis_error=error,
         fields=[
             MetaField(
                 exiftool_tag="EXIF:GPSLatitude",
@@ -44,6 +46,7 @@ def test_batch_processes_multiple_files(tmp_path, monkeypatch) -> None:
         return result, 3
 
     monkeypatch.setattr(cli.analyzer, "analyze", lambda path: _report(Path(path)))
+    monkeypatch.setattr(cli.analyzer, "verify", lambda path: [])
     monkeypatch.setattr(cli, "_process_clean", fake_process_clean)
 
     result = runner.invoke(cli.app, ["batch", str(file_a), str(file_b), "--mode", "clean", "--yes"])
@@ -72,6 +75,7 @@ def test_batch_continues_when_one_file_fails(tmp_path, monkeypatch) -> None:
         return result, 2
 
     monkeypatch.setattr(cli.analyzer, "analyze", lambda path: _report(Path(path)))
+    monkeypatch.setattr(cli.analyzer, "verify", lambda path: [])
     monkeypatch.setattr(cli, "_process_clean", fake_process_clean)
 
     result = runner.invoke(
@@ -79,10 +83,45 @@ def test_batch_continues_when_one_file_fails(tmp_path, monkeypatch) -> None:
         ["batch", str(good), str(bad), str(other), "--mode", "clean", "--yes"],
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert processed == ["good.jpg", "bad.jpg", "other.jpg"]
     assert "2 succeeded" in result.output
     assert "1 failed" in result.output
+
+
+def test_batch_returns_failure_for_unverified_analysis(tmp_path, monkeypatch) -> None:
+    file = tmp_path / "unverified.jpg"
+    file.write_bytes(b"x")
+
+    monkeypatch.setattr(
+        cli.analyzer,
+        "analyze",
+        lambda path: _report(Path(path), status="unverified", error="decode failed"),
+    )
+
+    result = runner.invoke(cli.app, ["batch", str(file), "--mode", "spoof", "--yes"])
+
+    assert result.exit_code == 1
+    assert "unverified" in result.output
+
+
+def test_batch_returns_failure_when_clean_leaves_residual(tmp_path, monkeypatch) -> None:
+    file = tmp_path / "dirty.jpg"
+    file.write_bytes(b"x")
+
+    def fake_process_clean(source: Path, output: Path | None = None):
+        result = output or source.with_name(f"{source.stem}_cleaned{source.suffix}")
+        result.write_bytes(source.read_bytes())
+        return result, 1
+
+    monkeypatch.setattr(cli.analyzer, "analyze", lambda path: _report(Path(path)))
+    monkeypatch.setattr(cli.analyzer, "verify", lambda path: [_report(Path(path)).fields[0]])
+    monkeypatch.setattr(cli, "_process_clean", fake_process_clean)
+
+    result = runner.invoke(cli.app, ["batch", str(file), "--mode", "clean", "--yes"])
+
+    assert result.exit_code == 1
+    assert "left" in result.output
 
 
 def test_dms_output_detection() -> None:

@@ -37,7 +37,7 @@ from dms.core.models import FileReport, MetaField, parse_metadata_datetime
 from dms.core.constants import ALWAYS_DELETE_PREFIXES, ALWAYS_DELETE_TAGS, REGION_XMP_NUKE_ARGS
 from dms.core.exiftool_tags import validate_exif_tag
 from dms.core.sanitizer import remove_all, remove_field
-from dms.core.utils import get_subprocess_flags, remove_exiftool_signature
+from dms.core.utils import EXIFTOOL_TEXT_KWARGS, get_subprocess_flags, remove_exiftool_signature
 from dms.config import require_exiftool
 from dms.core.spoofer import apply_field_spoof, apply_smart_spoof, set_filesystem_dates, spoof_filesystem_dates
 from dms.interfaces.gui.screens.screen_batch import ScreenBatch
@@ -335,8 +335,9 @@ def _nuke_region_blocks(target: Path) -> None:
     args.extend(REGION_XMP_NUKE_ARGS)
     args.append(str(target))
     subprocess.run(
-        args, capture_output=True, text=True,
+        args, capture_output=True,
         creationflags=get_subprocess_flags(),
+        **EXIFTOOL_TEXT_KWARGS,
     )
 
 
@@ -541,7 +542,7 @@ class BatchWorker(QThread):
                 args.append(f"-{safe}=")
             if len(args) > 2:
                 args.extend(["-overwrite_original", str(report.path)])
-                result = subprocess.run(args, capture_output=True, text=True, creationflags=get_subprocess_flags())
+                result = subprocess.run(args, capture_output=True, creationflags=get_subprocess_flags(), **EXIFTOOL_TEXT_KWARGS)
                 stderr = (result.stderr or "").strip()
                 if result.returncode != 0 and not _is_exiftool_warnings_only(stderr):
                     raise RuntimeError(stderr or "Failed to clean residual fields.")
@@ -1162,7 +1163,7 @@ class MainWindow(QMainWindow):
 
             if tags_to_clear:
                 args = [exiftool, "-m"] + tags_to_clear + ["-overwrite_original", str(target)]
-                result = subprocess.run(args, capture_output=True, text=True, creationflags=get_subprocess_flags())
+                result = subprocess.run(args, capture_output=True, creationflags=get_subprocess_flags(), **EXIFTOOL_TEXT_KWARGS)
                 stderr = (result.stderr or "").strip()
                 if result.returncode != 0 and not _is_exiftool_warnings_only(stderr):
                     raise RuntimeError(stderr or "Failed to remove residual fields.")

@@ -1,7 +1,9 @@
 from pathlib import Path
 
+import piexif
+
 from dms.core import analyzer
-from dms.core.analyzer import analyze
+from dms.core.analyzer import analyze, _safe_append
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -67,6 +69,7 @@ def test_image_analysis_falls_back_when_primary_and_fallback_fail(monkeypatch) -
 
     assert report.file_type == "jpeg"
     assert report.fields == []
+    assert report.analysis_status == "unverified"
     assert analyzer.IMAGE_PARSE_WARNING in report.warnings
 
 
@@ -78,3 +81,49 @@ def test_image_thumbnail_failure_only_adds_warning(monkeypatch) -> None:
     report = analyze(target)
 
     assert analyzer.IMAGE_THUMBNAIL_WARNING in report.warnings
+
+
+def test_non_ascii_metadata_is_read_with_utf8(tmp_path) -> None:
+    source = tmp_path / "unicode.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+    exif = piexif.load(str(source))
+    exif["0th"][piexif.ImageIFD.Artist] = b"\xe2\x98\x80 \xd0\x98\xd0\xb2\xd0\xb0\xd0\xbd"
+    piexif.insert(piexif.dump(exif), str(source))
+
+    report = analyze(source)
+
+    assert report.analysis_status == "ok"
+    assert report.analysis_error is None
+    artist = report.by_key()["Artist"]
+    assert artist.value == "\u2600 \u0418\u0432\u0430\u043d"
+    assert artist.is_sensitive is True
+
+
+def test_quicktime_container_tags_are_not_sensitive() -> None:
+    fields: list[analyzer.MetaField] = []
+    _safe_append(fields, "QuickTime:TimeScale", 1000)
+    _safe_append(fields, "QuickTime:HandlerDescription", "VideoHandler")
+    _safe_append(fields, "QuickTime:CompositionTimeToSample", "(Binary data 88 bytes)")
+
+    assert [field.is_sensitive for field in fields] == [False, False, False]
+    assert all(field.status == "clean" for field in fields)
+
+
+def test_zero_quicktime_dates_are_not_sensitive_but_real_dates_are() -> None:
+    fields: list[analyzer.MetaField] = []
+    _safe_append(fields, "QuickTime:TrackCreateDate", "0000:00:00 00:00:00")
+    _safe_append(fields, "QuickTime:TrackModifyDate", "0000:00:00 00:00:00")
+    _safe_append(fields, "QuickTime:CreateDate", "2024:04:18 10:22:33")
+
+    assert fields[0].is_sensitive is False
+    assert fields[1].is_sensitive is False
+    assert fields[2].is_sensitive is True
+    assert fields[2].status == "risk"
+
+
+def test_zip_container_timestamps_are_not_sensitive() -> None:
+    fields: list[analyzer.MetaField] = []
+    _safe_append(fields, "ZIP:ZipModifyDate", "1980:01:01 00:00:00")
+    _safe_append(fields, "ZIP:ZipCreateDate", "1980:01:01 00:00:00")
+
+    assert [field.is_sensitive for field in fields] == [False, False]

@@ -234,7 +234,60 @@ CAMERA_TECH_TAGS = {
     "SubSecTime",
 }
 
-TECHNICAL_TAGS = ICC_TAGS | FILE_TECH_TAGS | CAMERA_TECH_TAGS
+# QuickTime/MP4 container structure. These tags cannot be removed from the file
+# and describe the container, not the person who recorded it.
+QUICKTIME_TECH_TAGS = {
+    "Duration",
+    "TimeScale",
+    "PreviewTime",
+    "PreviewDuration",
+    "PosterTime",
+    "SelectionTime",
+    "SelectionDuration",
+    "CurrentTime",
+    "MovieHeaderVersion",
+    "PreferredRate",
+    "PreferredVolume",
+    "MatrixStructure",
+    "NextTrackID",
+    "HandlerType",
+    "HandlerVendorID",
+    "HandlerDescription",
+    "MediaTimeScale",
+    "MediaDuration",
+    "TrackDuration",
+    "TrackVolume",
+    "TrackHeaderVersion",
+    "TrackID",
+    "TrackLayer",
+    "TrackWidth",
+    "TrackHeight",
+    "CompositionTimeToSample",
+    "CompressorID",
+    "CompressorName",
+    "MajorBrand",
+    "MinorVersion",
+    "CompatibleBrands",
+    "MediaDataSize",
+    "MediaDataOffset",
+    "GraphicsMode",
+    "OpColor",
+    "Balance",
+    "AudioFormat",
+    "AudioChannels",
+    "AudioBitsPerSample",
+    "AudioSampleRate",
+    "VideoFrameRate",
+    "AvgBitrate",
+    "MaxBitrate",
+    "Bitrate",
+    "SampleRate",
+    "ChannelCount",
+    "LayoutFlags",
+    "LanguageCode",
+}
+
+TECHNICAL_TAGS = ICC_TAGS | FILE_TECH_TAGS | CAMERA_TECH_TAGS | QUICKTIME_TECH_TAGS
 
 SENSITIVE_KEYWORDS = [
     "GPS",

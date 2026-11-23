@@ -143,5 +143,62 @@ def test_strip_docx_tracked_changes_keeps_non_tracked_tags(tmp_path) -> None:
 
     assert "ins" not in local_names
     assert "del" not in local_names
+    assert "delText" not in local_names
+    assert "Deleted" not in transformed
+    assert "Inserted" in transformed
     assert "instrText" in local_names
     assert "DO_NOT_TOUCH" in transformed
+
+
+def test_cleaned_docx_does_not_keep_deleted_revision_text(tmp_path) -> None:
+    source = tmp_path / "tracked.docx"
+    source.write_bytes((FIXTURES / "test_document.docx").read_bytes())
+
+    with zipfile.ZipFile(source) as archive:
+        entries = {name: archive.read(name) for name in archive.namelist()}
+    document_xml = entries["word/document.xml"].decode("utf-8")
+    injected = (
+        '<w:p><w:r><w:t>BEFORE</w:t></w:r>'
+        '<w:ins w:id="1" w:author="A"><w:r><w:t>INSERTED_SECRET</w:t></w:r></w:ins>'
+        '<w:del w:id="2" w:author="A"><w:r><w:delText>DELETED_SECRET</w:delText></w:r></w:del>'
+        "</w:p>"
+    )
+    assert "</w:body>" in document_xml
+    entries["word/document.xml"] = document_xml.replace("</w:body>", injected + "</w:body>", 1).encode("utf-8")
+    with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in entries.items():
+            archive.writestr(name, data)
+
+    cleaned = remove_all(source)
+
+    with zipfile.ZipFile(cleaned) as archive:
+        body = archive.read("word/document.xml").decode("utf-8")
+    ET.fromstring(body)
+    assert "DELETED_SECRET" not in body
+    assert "delText" not in body
+    assert "INSERTED_SECRET" in body
+
+
+def test_clean_tiff_removes_stubborn_ifd0_tags(tmp_path) -> None:
+    source = tmp_path / "photo.tiff"
+    source.write_bytes((FIXTURES / "test_with_metadata.tiff").read_bytes())
+
+    cleaned = remove_all(source)
+
+    fields = analyze(cleaned).by_key()
+    assert "Make" not in fields
+    assert "Model" not in fields
+    assert "Software" not in fields
+    assert analyze(cleaned).analysis_status == "ok"
+
+
+def test_clean_tiny_webp_is_not_rejected_as_truncated(tmp_path) -> None:
+    source = tmp_path / "tiny.webp"
+    source.write_bytes((FIXTURES / "test_with_metadata.webp").read_bytes())
+
+    cleaned = remove_all(source)
+
+    assert cleaned.exists()
+    assert cleaned.stat().st_size > 0
+    assert analyze(cleaned).by_key().get("Make") is None
+    assert analyze(cleaned).analysis_status == "ok"

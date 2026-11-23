@@ -845,3 +845,54 @@ def test_verify_flags_location_and_editorial_residue(tmp_path) -> None:
     for field in analyze(source).fields:
         if field.key in ALL_RESIDUE_KEYS:
             assert field.is_sensitive is True, f"{field.key} must be sensitive"
+
+
+def test_guided_author_remove_clears_author_fields(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "source.jpg"
+    source.write_bytes(b"jpeg-data")
+    captured_writes: list[dict[str, object]] = []
+
+    def fake_run_edits(destination, clears, writes, *, soft_fail=False):
+        captured_writes.append(dict(writes))
+        return True
+
+    monkeypatch.setattr(spoofer_module, "get_exiftool_path", lambda: "exiftool")
+    monkeypatch.setattr(spoofer_module, "_run_exiftool_edits", fake_run_edits)
+
+    report = FileReport(
+        path=source,
+        file_type="jpeg",
+        fields=[
+            MetaField("EXIF:Artist", "Artist", "Artist", "Alice", "author", True, True),
+            MetaField("XMP-dc:Creator", "Creator", "Creator", "Alice", "author", True, True),
+        ],
+    )
+
+    apply_spoof(
+        report,
+        SpoofProfile(gps_mode="manual", gps_target=None, author="", dates_mode="keep"),
+    )
+
+    all_writes = {key: value for batch in captured_writes for key, value in batch.items()}
+    assert all_writes.get("EXIF:Artist") == ""
+    assert all_writes.get("XMP-dc:Creator") == ""
+
+
+def test_apply_spoof_writes_to_explicit_output_path(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "source.jpg"
+    source.write_bytes(b"jpeg-data")
+    target = tmp_path / "custom.jpg"
+
+    monkeypatch.setattr(spoofer_module, "get_exiftool_path", lambda: "exiftool")
+    monkeypatch.setattr(spoofer_module, "_run_exiftool_edits", lambda *args, **kwargs: True)
+
+    report = FileReport(path=source, file_type="jpeg", fields=[])
+
+    result = apply_spoof(
+        report,
+        SpoofProfile(gps_mode="manual", gps_target=None, dates_mode="keep"),
+        output_path=target,
+    )
+
+    assert result == target
+    assert target.exists()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
+import os
 import subprocess
 import sys
 import tempfile
@@ -31,9 +31,9 @@ from dms.core.device_db import get_all_devices, get_all_makes, get_models_by_mak
 from dms.core.error_messages import classify_exiftool_error, get_error
 from dms.core.exiftool_tags import validate_exif_tag
 from dms.core.models import FileReport, MetaField, SpoofProfile
-from dms.core.sanitizer import remove_all
+from dms.core.sanitizer import OutputPathError, build_output_path, remove_all
 from dms.core.spoofer import apply_smart_spoof, apply_spoof
-from dms.core.utils import EXIFTOOL_TIMEOUT, get_subprocess_flags
+from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags
 from dms.interfaces.watcher import DMSEventHandler
 
 
@@ -74,16 +74,6 @@ CATEGORY_TITLES = {
     "author": "Author",
     "dates": "Dates",
     "other": "Other",
-}
-
-CLI_LINKED_TAGS = {
-    "datetimeoriginal": ["date/time original", "datetime original", "subsectimeoriginal"],
-    "createdate": ["date created", "creation date", "captured at"],
-    "modifydate": ["modified at", "pdf modified", "metadata date"],
-    "gpsdatetime": ["gps date stamp", "gps time stamp", "gps date/time"],
-    "gpslatitude": ["gps position", "gps latitude ref", "gps longitude ref", "gps longitude", "gps altitude", "gps altitude ref"],
-    "make": ["device make", "device model", "lens model", "lens id", "lens make", "creator tool", "software", "model"],
-    "author": ["creator", "artist", "xmp:creator", "dc:creator"],
 }
 
 CLI_INFO_MESSAGES = {
@@ -150,10 +140,10 @@ def get_exiftool_version() -> str:
         result = subprocess.run(
             [exiftool, "-ver"],
             capture_output=True,
-            text=True,
             check=False,
             timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
+            **EXIFTOOL_TEXT_KWARGS,
         )
         version = (result.stdout or "").strip()
         return version or "not found"
@@ -181,6 +171,9 @@ def handle_exception(exc: Exception) -> None:
         raise typer.Exit(1)
     if isinstance(exc, PermissionError):
         print_error(get_error("file_permission", "en"))
+        raise typer.Exit(1)
+    if isinstance(exc, OutputPathError):
+        print_error(str(exc))
         raise typer.Exit(1)
     if isinstance(exc, RuntimeError):
         message = classify_exiftool_error(str(exc), "en")
@@ -257,33 +250,6 @@ def _field_aliases(field: MetaField) -> set[str]:
     return {item for item in aliases if item}
 
 
-def _expand_linked_keys(keys: set[str]) -> set[str]:
-    expanded = {_canonical_key(key) for key in keys if key}
-    for key in list(expanded):
-        for source, linked in CLI_LINKED_TAGS.items():
-            linked_set = {_canonical_key(item) for item in linked}
-            if source in key or key in source or key in linked_set:
-                expanded.add(source)
-                expanded.update(linked_set)
-    return expanded
-
-
-def _cli_spoofed_keys(report: FileReport, changes: list[str]) -> set[str]:
-    keys: set[str] = set()
-    for field in report.fields:
-        if "gps" in changes and field.category == "gps":
-            keys.add(field.key)
-        elif "device" in changes and field.category == "device":
-            keys.add(field.key)
-        elif "dates" in changes and field.category == "dates":
-            keys.add(field.key)
-        elif "author" in changes and field.category == "author":
-            keys.add(field.key)
-        elif "software" in changes and "software" in field.key.lower():
-            keys.add(field.key)
-    return _expand_linked_keys(keys)
-
-
 def _apply_cli_statuses(report: FileReport, spoofed_keys: set[str] | None = None, removed_keys: set[str] | None = None) -> None:
     spoofed = {_canonical_key(key) for key in (spoofed_keys or set())}
     removed = {_canonical_key(key) for key in (removed_keys or set())}
@@ -297,14 +263,68 @@ def _apply_cli_statuses(report: FileReport, spoofed_keys: set[str] | None = None
             field.status = "risk" if field.is_sensitive else "clean"
 
 
+def _report_diff(before: FileReport, after: FileReport) -> tuple[set[str], set[str]]:
+    """Return field keys that actually changed and keys that disappeared."""
+
+    after_values: dict[str, set[str]] = {}
+    for field in after.fields:
+        after_values.setdefault(field.key, set()).add(str(field.value))
+    before_keys = {field.key for field in before.fields}
+
+    changed: set[str] = set()
+    removed: set[str] = set()
+    for field in before.fields:
+        if field.is_computed or not field.is_sensitive or field.key in analyzer.FILESYSTEM_DATE_KEYS:
+            continue
+        values = after_values.get(field.key)
+        if values is None:
+            removed.add(field.key)
+        elif str(field.value) not in values:
+            changed.add(field.key)
+    for field in after.fields:
+        if (
+            field.key not in before_keys
+            and not field.is_computed
+            and field.is_sensitive
+            and field.key not in analyzer.FILESYSTEM_DATE_KEYS
+        ):
+            changed.add(field.key)
+    return changed, removed
+
+
+def _changed_categories(before: FileReport, after: FileReport, keys: set[str]) -> list[str]:
+    order = ["gps", "device", "author", "dates", "other"]
+    present = {
+        field.category
+        for report in (before, after)
+        for field in report.fields
+        if field.key in keys
+    }
+    return [category for category in order if category in present]
+
+
 def _risk_count(report: FileReport) -> int:
-    return sum(1 for field in report.fields if field.status == "risk")
+    return sum(
+        1
+        for field in report.fields
+        if field.status == "risk" and field.key not in analyzer.FILESYSTEM_DATE_KEYS
+    )
 
 
 def _serialize_report(report: FileReport) -> dict[str, Any]:
+    risk_count = _risk_count(report)
+    if report.analysis_status != "ok":
+        status = "unverified"
+    elif risk_count:
+        status = "dirty"
+    else:
+        status = "clean"
     return {
         "path": str(report.path),
         "file_type": report.file_type,
+        "status": status,
+        "analysis_status": report.analysis_status,
+        "analysis_error": report.analysis_error,
         "warnings": report.warnings,
         "empty_reason": report.empty_reason,
         "fields": [
@@ -357,7 +377,13 @@ def _render_analysis_table(report: FileReport) -> None:
             table.add_row(field.label, _field_value(field.value), _risk_icon(field))
         console.print(table)
     sensitive = _risk_count(report)
-    categories = len([1 for _, fields in _group_fields(report) if any(field.status == "risk" for field in fields)])
+    categories = len(
+        [
+            1
+            for _, fields in _group_fields(report)
+            if any(field.status == "risk" and field.key not in analyzer.FILESYSTEM_DATE_KEYS for field in fields)
+        ]
+    )
     console.print(f"[bold bright_white]Summary:[/bold bright_white] {sensitive} sensitive fields found across {categories} categories.")
 
 
@@ -423,14 +449,23 @@ def _default_spoof_output(path: Path, output: Path | None) -> Path:
     return output or path.with_name(f"{path.stem}_spoofed{path.suffix}")
 
 
-def _move_result(result_path: Path, target: Path) -> Path:
-    if result_path.resolve() == target.resolve():
-        return result_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        target.unlink()
-    shutil.move(str(result_path), str(target))
-    return target
+def _same_file(first: Path, second: Path) -> bool:
+    try:
+        if first.resolve() == second.resolve():
+            return True
+        return second.exists() and first.exists() and os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def _ensure_output_differs(source: Path, target: Path) -> None:
+    if _same_file(source, target):
+        raise OutputPathError("Output path must differ from the source file. DMS never overwrites the original.")
+
+
+def _confirm_overwrite(target: Path, *, yes: bool) -> None:
+    if target.exists() and not _confirm(f"{target} already exists. Overwrite?", yes=yes):
+        raise typer.Exit(1)
 
 
 def _preview_spoof_plan(report: FileReport, profile: SpoofProfile, smart: bool) -> tuple[Table, list[str]]:
@@ -440,16 +475,40 @@ def _preview_spoof_plan(report: FileReport, profile: SpoofProfile, smart: bool) 
     table.add_column("Will become", style="bold bright_magenta", overflow="fold")
     changes: list[str] = []
 
-    gps_lat = report.by_key().get("GPSLatitude")
-    gps_lon = report.by_key().get("GPSLongitude")
-    if gps_lat and gps_lon and gps_lat.value not in (None, "") and gps_lon.value not in (None, ""):
-        target = "~same country (random)" if smart or profile.gps_mode == "smart" else "removed" if profile.gps_mode == "remove" else str(profile.gps_target)
-        table.add_row("GPS Location", f"{gps_lat.value}, {gps_lon.value}", target)
+    fields = report.by_key()
+    gps_lat = fields.get("GPSLatitude")
+    gps_lon = fields.get("GPSLongitude")
+    has_gps_metadata = any(
+        field.category == "gps" and field.value not in (None, "", [])
+        for field in report.fields
+    )
+    gps_target_text: str | None = None
+    if smart:
+        if gps_lat and gps_lon and gps_lat.value not in (None, "") and gps_lon.value not in (None, ""):
+            gps_target_text = "~same country (random)"
+    elif has_gps_metadata:
+        if profile.gps_mode == "remove":
+            gps_target_text = "removed"
+        elif profile.gps_mode == "manual" and profile.gps_target:
+            gps_target_text = str(profile.gps_target)
+        elif profile.gps_mode == "smart":
+            gps_target_text = "~same country (random)"
+    if gps_target_text is not None:
+        original = (
+            f"{gps_lat.value}, {gps_lon.value}"
+            if gps_lat and gps_lon and gps_lat.value not in (None, "") and gps_lon.value not in (None, "")
+            else "—"
+        )
+        table.add_row("GPS Location", original, gps_target_text)
         changes.append("gps")
 
-    make = report.by_key().get("Make")
-    model = report.by_key().get("Model")
-    if make or model:
+    make = fields.get("Make")
+    model = fields.get("Model")
+    device_will_change = (
+        (smart and make is not None)
+        or (not smart and bool(profile.device_make and profile.device_model))
+    )
+    if device_will_change:
         device_text = "random device"
         if profile.device_make and profile.device_model:
             device_text = f"{profile.device_make} {profile.device_model}"
@@ -463,7 +522,8 @@ def _preview_spoof_plan(report: FileReport, profile: SpoofProfile, smart: bool) 
         changes.append("device")
 
     date_field = next((field for field in report.fields if field.category == "dates"), None)
-    if date_field:
+    dates_will_change = (smart and date_field is not None) or (not smart and profile.dates_mode != "keep")
+    if dates_will_change:
         if smart or profile.dates_mode == "random":
             target = "random past date"
         elif profile.dates_mode == "remove":
@@ -471,33 +531,28 @@ def _preview_spoof_plan(report: FileReport, profile: SpoofProfile, smart: bool) 
         elif profile.dates_mode == "shift":
             target = f"shifted by {profile.dates_shift_days} days"
         else:
-            target = str(date_field.value)
-        table.add_row("Create Date", _field_value(date_field.value), target)
+            target = "kept"
+        table.add_row("Create Date", _field_value(date_field.value) if date_field else "—", target)
         changes.append("dates")
 
     author_field = next((field for field in report.fields if field.category == "author"), None)
     if author_field and (smart or profile.author is not None):
-        target = "random name" if smart or profile.author == "random" else "removed" if profile.author == "" else str(profile.author)
+        if smart:
+            target = "random name"
+        elif profile.author == "":
+            target = "removed"
+        else:
+            target = str(profile.author)
         table.add_row("Author", _field_value(author_field.value), target)
         changes.append("author")
 
     return table, changes
 
 
-def _estimate_changed_fields(report: FileReport, changes: list[str]) -> int:
-    total = 0
-    for field in report.fields:
-        if "gps" in changes and field.category == "gps":
-            total += 1
-        elif "device" in changes and field.category == "device":
-            total += 1
-        elif "dates" in changes and field.category == "dates":
-            total += 1
-        elif "author" in changes and field.category == "author":
-            total += 1
-        elif "software" in changes and "software" in field.key.lower():
-            total += 1
-    return total
+def _batch_target(file: Path, output_dir: Path | None, mode: str) -> Path:
+    suffix = "spoofed" if mode == "spoof" else "cleaned"
+    name = f"{file.stem}_{suffix}{file.suffix}"
+    return output_dir / name if output_dir else file.with_name(name)
 
 
 def _expand_batch_inputs(files: list[Path]) -> list[Path]:
@@ -534,7 +589,7 @@ def _remove_residual_fields(path: Path, fields: list[MetaField]) -> int:
     if applied == 0:
         return 0
     args.extend(["-overwrite_original", str(path)])
-    result = subprocess.run(args, capture_output=True, text=True, check=False, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags())
+    result = subprocess.run(args, capture_output=True, check=False, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags(), **EXIFTOOL_TEXT_KWARGS)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "Failed to remove residual fields.")
     return applied
@@ -559,7 +614,11 @@ def _print_info_codes(info_codes: list[str]) -> None:
 
 
 def _render_verification(path: Path) -> bool:
-    residual = analyzer.residual_sensitive_fields(analyzer.analyze(path))
+    try:
+        residual = analyzer.verify(path)
+    except analyzer.MetadataAnalysisError as exc:
+        console.print(f"[bold red]! Verification unavailable:[/bold red] {_field_value(exc)}")
+        return False
     if not residual:
         console.print("[bold green]✓ Verified:[/bold green] no sensitive metadata remains.")
         return True
@@ -589,18 +648,23 @@ def _process_spoof(
 ) -> tuple[Path, list[str], list[str], int, int, int, int]:
     report = analyzer.analyze(file)
     original_risk = _risk_count(report)
-    result, changes, info_codes = apply_smart_spoof(report)
-    final_path = _move_result(result, _default_spoof_output(file, output))
-    changed_fields = _estimate_changed_fields(report, changes)
-    spoofed_keys = _cli_spoofed_keys(report, changes)
-    reloaded = analyzer.analyze(final_path)
-    _apply_cli_statuses(reloaded, spoofed_keys=spoofed_keys)
+    final_path = _default_spoof_output(file, output)
+    _ensure_output_differs(file, final_path)
+    result, _, info_codes = apply_smart_spoof(report, output_path=final_path)
+    reloaded = analyzer.analyze(result)
+    changed_keys, removed_keys = _report_diff(report, reloaded)
+    _apply_cli_statuses(reloaded, spoofed_keys=changed_keys, removed_keys=removed_keys)
+    changes = _changed_categories(report, reloaded, changed_keys | removed_keys)
+    changed_fields = len(changed_keys | removed_keys)
     removed_residual = 0
     if residual and auto_remove_residual:
-        removed_residual = _remove_residual_fields(final_path, _residual_fields(reloaded, spoofed_keys))
-        reloaded = analyzer.analyze(final_path)
-        _apply_cli_statuses(reloaded, spoofed_keys=spoofed_keys)
-    return final_path, changes, info_codes, changed_fields, removed_residual, original_risk, _risk_count(reloaded)
+        residual_fields = _residual_fields(reloaded, changed_keys)
+        residual_keys = {field.key for field in residual_fields}
+        removed_residual = _remove_residual_fields(result, residual_fields)
+        if removed_residual:
+            reloaded = analyzer.analyze(result)
+            _apply_cli_statuses(reloaded, spoofed_keys=changed_keys, removed_keys=removed_keys | residual_keys)
+    return result, changes, info_codes, changed_fields, removed_residual, original_risk, _risk_count(reloaded)
 
 
 @app.callback(invoke_without_command=True)
@@ -638,13 +702,24 @@ def analyze(
         report = analyzer.analyze(file)
         lowered = format.lower()
         if lowered == "json":
-            console.print(json.dumps(_serialize_report(report), default=str, ensure_ascii=False))
-            return
-        if lowered == "minimal":
+            console.print(
+                json.dumps(_serialize_report(report), default=str, ensure_ascii=False),
+                soft_wrap=True,
+                markup=False,
+                highlight=False,
+            )
+        elif lowered == "minimal":
             _render_minimal(report)
-            return
-        print_banner()
-        _render_analysis_table(report)
+        else:
+            print_banner()
+            _render_analysis_table(report)
+        if report.analysis_status != "ok":
+            if lowered != "json":
+                console.print(
+                    f"[bold yellow]! Analysis incomplete:[/bold yellow] "
+                    f"{report.analysis_error or 'metadata could not be read completely.'}"
+                )
+            raise typer.Exit(1)
     except (typer.Exit, typer.Abort):
         raise
     except Exception as exc:
@@ -680,6 +755,11 @@ def clean(
         print_banner()
         report = analyzer.analyze(file)
         sensitive = _risk_count(report)
+        if report.analysis_status != "ok":
+            console.print(f"[bold yellow]! Warning:[/bold yellow] {report.analysis_error or 'metadata could not be read completely.'}")
+        target = build_output_path(file, output)
+        _ensure_output_differs(file, target)
+        _confirm_overwrite(target, yes=yes)
         console.print(f"Found [bold red]{sensitive}[/bold red] sensitive fields in [bold bright_white]{file.name}[/bold bright_white]")
         if not _confirm("This will remove ALL metadata. Continue?", yes=yes):
             raise typer.Exit()
@@ -693,13 +773,14 @@ def clean(
             console=console,
         ) as progress:
             task = progress.add_task("Removing metadata...", total=100)
-            result = remove_all(file, output)
+            result = remove_all(file, target)
             progress.update(task, completed=100)
 
         console.print(f"[bold green]✓ Cleaned:[/bold green] {result.name}")
         console.print(f"Removed [bold red]{sensitive}[/bold red] sensitive fields.")
         console.print(f"[dim white]Saved to:[/dim white] {result}")
-        _render_verification(result)
+        if not _render_verification(result):
+            raise typer.Exit(1)
     except (typer.Exit, typer.Abort):
         raise
     except Exception as exc:
@@ -729,6 +810,8 @@ def spoof(
             if not yes and not typer.confirm("Proceed?", default=False):
                 raise typer.Abort()
         original_risk = _risk_count(report)
+        if report.analysis_status != "ok":
+            console.print(f"[bold yellow]! Warning:[/bold yellow] {report.analysis_error or 'metadata could not be read completely.'}")
         gps_mode, gps_target = _parse_gps_argument(gps)
         dates_mode, dates_shift_days = _parse_dates_argument(dates)
         profile = SpoofProfile(gps_mode=gps_mode, gps_target=gps_target, dates_mode=dates_mode, dates_shift_days=dates_shift_days)
@@ -741,7 +824,11 @@ def spoof(
         if author:
             profile.author = "" if author == "remove" else author
 
-        plan_table, planned_changes = _preview_spoof_plan(report, profile, smart)
+        final_target = _default_spoof_output(file, output)
+        _ensure_output_differs(file, final_target)
+        _confirm_overwrite(final_target, yes=yes)
+
+        plan_table, _ = _preview_spoof_plan(report, profile, smart)
         console.print(f"[bold bright_white]Smart Spoof plan for {file.name}:[/bold bright_white]")
         console.print(plan_table)
         if not _confirm("Proceed?", yes=yes):
@@ -758,31 +845,31 @@ def spoof(
             task = progress.add_task("Spoofing metadata...", total=4)
             info_codes: list[str] = []
             if smart:
-                result, changes, info_codes = apply_smart_spoof(report)
-                changed_fields = _estimate_changed_fields(report, changes)
+                result, _, info_codes = apply_smart_spoof(report, output_path=final_target)
                 progress.update(task, advance=4)
-                final_path = _move_result(result, _default_spoof_output(file, output))
             else:
                 progress.update(task, description="[1/4] Preparing spoof plan...")
                 progress.advance(task)
                 progress.update(task, description="[2/4] Writing spoofed metadata...")
-                result = apply_spoof(report, profile)
+                result = apply_spoof(report, profile, output_path=final_target)
                 progress.advance(task)
                 progress.update(task, description="[3/4] Finalizing output...")
-                final_path = _move_result(result, _default_spoof_output(file, output))
                 progress.advance(task)
                 progress.update(task, description="[4/4] Done")
                 progress.advance(task)
-                changes = planned_changes
-                changed_fields = _estimate_changed_fields(report, changes)
+            final_path = result
 
-        spoofed_keys = _cli_spoofed_keys(report, changes)
         reloaded = analyzer.analyze(final_path)
-        _apply_cli_statuses(reloaded, spoofed_keys=spoofed_keys)
+        changed_keys, removed_keys = _report_diff(report, reloaded)
+        _apply_cli_statuses(reloaded, spoofed_keys=changed_keys, removed_keys=removed_keys)
+        changes = _changed_categories(report, reloaded, changed_keys | removed_keys)
+        changed_fields = len(changed_keys | removed_keys)
+        if reloaded.analysis_status != "ok":
+            console.print(f"[bold yellow]! Verification unavailable:[/bold yellow] {reloaded.analysis_error or 'metadata could not be read completely.'}")
 
         removed_residual = 0
         if residual:
-            residual_candidates = _residual_fields(reloaded, spoofed_keys)
+            residual_candidates = _residual_fields(reloaded, changed_keys)
             if residual_candidates:
                 residual_table = Table(box=box.ROUNDED, header_style="bold bright_white")
                 residual_table.add_column("Field", style="bright_cyan")
@@ -796,7 +883,11 @@ def spoof(
                 if _confirm("Remove these fields?", yes=yes):
                     removed_residual = _remove_residual_fields(final_path, residual_candidates)
                     reloaded = analyzer.analyze(final_path)
-                    _apply_cli_statuses(reloaded, spoofed_keys=spoofed_keys, removed_keys={field.key for field in residual_candidates})
+                    _apply_cli_statuses(
+                        reloaded,
+                        spoofed_keys=changed_keys,
+                        removed_keys=removed_keys | {field.key for field in residual_candidates},
+                    )
 
         final_risk = _risk_count(reloaded)
         console.print(f"[bold bright_magenta]✓ Spoofed:[/bold bright_magenta] {final_path.name}")
@@ -976,6 +1067,14 @@ def batch(
         if not _confirm(f"Process {len(expanded)} files in {mode} mode?", yes=yes):
             raise typer.Exit()
 
+        targets = {file: _batch_target(file, output_dir, mode) for file in expanded}
+        existing_targets = sum(1 for target in targets.values() if target.exists())
+        if existing_targets and not _confirm(
+            f"{existing_targets} output file(s) already exist. Overwrite?",
+            yes=yes,
+        ):
+            raise typer.Exit(1)
+
         summary: list[tuple[str, str, str, str]] = []
         succeeded = failed = skipped = 0
 
@@ -993,16 +1092,24 @@ def batch(
                 try:
                     report = analyzer.analyze(file)
                     sensitive = _risk_count(report)
-                    if sensitive == 0:
+                    if sensitive == 0 and report.analysis_status == "ok":
                         skipped += 1
                         summary.append((file.name, "0", "skipped", "—"))
                         progress.update(tasks[file], completed=100, description=f"{file.name} skipped")
                         progress.advance(overall)
                         continue
+                    if report.analysis_status != "ok":
+                        console.print(f"[bold yellow]! {file.name}:[/bold yellow] {report.analysis_error or 'metadata could not be read completely.'}")
 
                     if mode == "spoof":
+                        if report.analysis_status != "ok":
+                            failed += 1
+                            summary.append((file.name, "—", "unverified", "✗"))
+                            progress.update(tasks[file], completed=100, description=f"{file.name} unverified")
+                            progress.advance(overall)
+                            continue
                         progress.update(tasks[file], description=f"{file.name} spoofing")
-                        output = output_dir / f"{file.stem}_spoofed{file.suffix}" if output_dir else None
+                        output = targets[file]
                         result, _, info_codes, fields_changed, removed_residual, _, _ = _process_spoof(
                             file,
                             output,
@@ -1019,10 +1126,20 @@ def batch(
                         summary.append((result.name, str(fields_changed), action, "✓"))
                     else:
                         progress.update(tasks[file], description=f"{file.name} cleaning")
-                        output = output_dir / f"{file.stem}_cleaned{file.suffix}" if output_dir else None
+                        output = targets[file]
                         result, removed = _process_clean(file, output)
-                        succeeded += 1
-                        summary.append((result.name, str(removed), "cleaned", "✓"))
+                        try:
+                            leftover = analyzer.verify(result)
+                        except analyzer.MetadataAnalysisError as exc:
+                            failed += 1
+                            summary.append((result.name, str(removed), f"unverified: {exc}", "✗"))
+                        else:
+                            if leftover:
+                                failed += 1
+                                summary.append((result.name, str(removed), f"cleaned, {len(leftover)} left", "✗"))
+                            else:
+                                succeeded += 1
+                                summary.append((result.name, str(removed), "cleaned", "✓"))
 
                     progress.update(tasks[file], completed=100)
                     progress.advance(overall)
@@ -1044,6 +1161,8 @@ def batch(
         console.print(f"[bold green]{succeeded} succeeded[/bold green], [bold red]{failed} failed[/bold red], [bold yellow]{skipped} skipped[/bold yellow].")
         if output_dir:
             console.print(f"[dim white]Saved to:[/dim white] {output_dir}")
+        if failed:
+            raise typer.Exit(1)
     except (typer.Exit, typer.Abort):
         raise
     except Exception as exc:

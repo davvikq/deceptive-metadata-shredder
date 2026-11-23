@@ -22,9 +22,14 @@ from pypdf.generic import NameObject
 from dms.config import require_exiftool
 from dms.core.exiftool_tags import validate_exif_tag
 from dms.core.models import FileReport
-from dms.core.utils import EXIFTOOL_TIMEOUT, get_subprocess_flags, remove_exiftool_signature
+from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags, remove_exiftool_signature
 
 INTERRUPT_LOG = "Process interrupted. Original file %s remains unchanged."
+
+
+class OutputPathError(ValueError):
+    """Raised when an output path would overwrite the source file."""
+
 
 # Reject obviously truncated outputs (metadata edits rarely shrink the payload this much).
 _ATOMIC_MIN_ABSOLUTE = 256
@@ -59,7 +64,8 @@ def _validate_atomic_output(source_size: int, result_path: Path) -> None:
         raise RuntimeError("Refusing to replace destination: processed file is empty.")
     if source_size == 0:
         return
-    if source_size >= _ATOMIC_MIN_ABSOLUTE and result_size < _ATOMIC_MIN_ABSOLUTE:
+    # Small files (icons, tiny WebP) can legitimately shrink below 256 bytes.
+    if source_size >= 4096 and result_size < _ATOMIC_MIN_ABSOLUTE:
         raise RuntimeError("Refusing to replace destination: processed file is implausibly small.")
     ratio = result_size / source_size
     if source_size >= 4096 and ratio < _ATOMIC_RATIO_FLOOR:
@@ -123,16 +129,58 @@ def _resolve_edit_destination_path(source: Path, output_path: Path | None = None
     return build_output_path(source)
 
 
-def _sanitize_with_exiftool(destination: Path) -> None:
-    exiftool = require_exiftool()
-    subprocess.run(
-        [exiftool, "-overwrite_original_in_place", "-all=", str(destination)],
-        check=True,
+def _clear_residual_sensitive_tags(destination: Path, exiftool: str) -> None:
+    """Second pass for formats where -all= cannot delete a container (e.g. TIFF IFD0)."""
+
+    from dms.core.analyzer import FILESYSTEM_DATE_KEYS, analyze
+
+    try:
+        report = analyze(destination)
+    except Exception as exc:
+        logging.warning("Residual metadata analysis failed for %s: %s", destination, exc)
+        return
+    clears: list[str] = []
+    for field in report.fields:
+        if not field.is_sensitive or field.is_computed or field.key in FILESYSTEM_DATE_KEYS:
+            continue
+        try:
+            safe_tag = validate_exif_tag(field.exiftool_tag)
+        except ValueError:
+            continue
+        clears.append(f"-{safe_tag}=")
+    if not clears:
+        return
+    result = subprocess.run(
+        [exiftool, "-m", "-overwrite_original_in_place", *dict.fromkeys(clears), str(destination)],
         capture_output=True,
-        text=True,
+        check=False,
         timeout=EXIFTOOL_TIMEOUT,
         creationflags=get_subprocess_flags(),
+        **EXIFTOOL_TEXT_KWARGS,
     )
+    if result.returncode != 0:
+        logging.warning(
+            "Residual metadata cleanup failed for %s: %s",
+            destination,
+            (result.stderr or "").strip(),
+        )
+
+
+def _sanitize_with_exiftool(destination: Path) -> None:
+    exiftool = require_exiftool()
+    result = subprocess.run(
+        [exiftool, "-overwrite_original_in_place", "-all=", str(destination)],
+        check=False,
+        capture_output=True,
+        timeout=EXIFTOOL_TIMEOUT,
+        creationflags=get_subprocess_flags(),
+        **EXIFTOOL_TEXT_KWARGS,
+    )
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        raise RuntimeError(stderr or "exiftool sanitization failed.")
+    if "can't delete" in stderr.lower():
+        _clear_residual_sensitive_tags(destination, exiftool)
 
 
 def remove_field(
@@ -158,9 +206,9 @@ def remove_field(
                 str(staging),
             ],
             capture_output=True,
-            text=True,
             timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
+            **EXIFTOOL_TEXT_KWARGS,
         )
         stderr = (result.stderr or "").strip()
         warning_markers = [
@@ -236,7 +284,7 @@ def _sanitize_pdf(destination: Path) -> None:
 
 
 def _strip_docx_tracked_changes(document_xml: Path) -> None:
-    """Replace w:ins/w:del wrappers with their children, preserving other tags."""
+    """Accept insertions, drop deletions, and remove all revision wrappers."""
 
     try:
         root = ET.fromstring(document_xml.read_text(encoding="utf-8"))
@@ -245,19 +293,29 @@ def _strip_docx_tracked_changes(document_xml: Path) -> None:
         return
 
     ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    tracked_tags = {f"{ns}ins", f"{ns}del"}
+    inserted_tags = {f"{ns}ins", f"{ns}moveTo"}
+    deleted_tags = {f"{ns}del", f"{ns}moveFrom"}
+    deleted_content_tags = {f"{ns}delText", f"{ns}delInstrText"}
 
-    def unwrap(parent: ET.Element) -> None:
+    def clean_children(parent: ET.Element) -> None:
+        kept: list[ET.Element] = []
         for child in list(parent):
-            unwrap(child)
-            if child.tag in tracked_tags:
-                index = list(parent).index(child)
-                parent.remove(child)
-                for grandchild in list(child):
-                    parent.insert(index, grandchild)
-                    index += 1
+            if child.tag in deleted_tags:
+                # Deleted/moved-away revisions must disappear completely.
+                continue
+            if child.tag in inserted_tags:
+                clean_children(child)
+                kept.extend(list(child))
+                continue
+            clean_children(child)
+            if child.tag in deleted_content_tags:
+                continue
+            kept.append(child)
+        for child in list(parent):
+            parent.remove(child)
+        parent.extend(kept)
 
-    unwrap(root)
+    clean_children(root)
     document_xml.write_text(ET.tostring(root, encoding="unicode"), encoding="utf-8")
 
 
@@ -281,9 +339,17 @@ def _sanitize_docx(destination: Path) -> None:
         with zipfile.ZipFile(destination) as archive:
             _safe_extractall(archive, extract_root)
 
-        document_xml = extract_root / "word" / "document.xml"
-        if document_xml.exists():
-            _strip_docx_tracked_changes(document_xml)
+        word_root = extract_root / "word"
+        tracked_change_parts = [
+            word_root / "document.xml",
+            word_root / "footnotes.xml",
+            word_root / "endnotes.xml",
+            *sorted(word_root.glob("header*.xml")),
+            *sorted(word_root.glob("footer*.xml")),
+        ]
+        for xml_path in tracked_change_parts:
+            if xml_path.exists():
+                _strip_docx_tracked_changes(xml_path)
 
         # Document properties and revision/comment authors live in different
         # OOXML parts. Clearing only python-docx core_properties misses them.
@@ -294,7 +360,6 @@ def _sanitize_docx(destination: Path) -> None:
                 tree.getroot().clear()
                 tree.write(str(properties_xml), encoding="UTF-8", xml_declaration=True)
 
-        word_root = extract_root / "word"
         for xml_path in word_root.rglob("*.xml"):
             tree = etree.parse(str(xml_path), parser=etree.XMLParser(resolve_entities=False, no_network=True))
             changed = False

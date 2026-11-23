@@ -28,7 +28,7 @@ from dms.core.device_db import get_all_devices, get_models_by_make, get_random_d
 from dms.core.exiftool_tags import validate_exif_tag
 from dms.core.models import FileReport, MetaField, SpoofProfile, parse_metadata_datetime
 from dms.core.sanitizer import repack_docx_zip_dates, resolve_spoof_destination, run_atomic_file_update
-from dms.core.utils import EXIFTOOL_TIMEOUT, get_subprocess_flags, remove_exiftool_signature
+from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags, remove_exiftool_signature
 
 _PROFILE_CREATOR_POOL = ("MSFT", "GOOG", "ADBE", "SUNW")
 
@@ -77,9 +77,9 @@ def _nuke_always_delete_tags(destination: Path, file_report: "FileReport") -> tu
         args.append(str(destination))
         logging.debug("Nuking Region XMP blocks: %s", REGION_XMP_NUKE_ARGS)
         result = subprocess.run(
-            args, capture_output=True, text=True,
-            timeout=EXIFTOOL_TIMEOUT,
+            args, capture_output=True, timeout=EXIFTOOL_TIMEOUT,
             creationflags=get_subprocess_flags(),
+            **EXIFTOOL_TEXT_KWARGS,
         )
         if result.returncode != 0:
             region_ok = False
@@ -240,10 +240,10 @@ def _clear_offset_tags(destination: Path) -> None:
             str(destination),
         ],
         capture_output=True,
-        text=True,
         check=False,
         timeout=EXIFTOOL_TIMEOUT,
         creationflags=get_subprocess_flags(),
+        **EXIFTOOL_TEXT_KWARGS,
     )
 
 
@@ -271,7 +271,7 @@ def _apply_heic_dates(destination: Path, report: FileReport, value: datetime | N
             args.append(f"-{tag}=" if remove else f"-{tag}={fake_subsec}")
 
     args.append(str(destination))
-    result = subprocess.run(args, capture_output=True, text=True, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags())
+    result = subprocess.run(args, capture_output=True, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags(), **EXIFTOOL_TEXT_KWARGS)
     if "0 image files updated" in (result.stdout or ""):
         logging.error("HEIC date write: 0 files updated, stderr=%s", (result.stderr or "").strip())
         raise PermissionError("No date fields could be written")
@@ -308,7 +308,7 @@ def _apply_dates_to_destination(destination: Path, report: FileReport, value: da
             args.append(f"-{tag}=" if remove else f"-{tag}={fake_subsec}")
 
     args.append(str(destination))
-    result = subprocess.run(args, capture_output=True, text=True, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags())
+    result = subprocess.run(args, capture_output=True, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags(), **EXIFTOOL_TEXT_KWARGS)
     if "0 image files updated" in (result.stdout or ""):
         raise PermissionError("No date fields could be written")
     if result.returncode != 0:
@@ -358,7 +358,7 @@ def _run_exiftool_edits(destination: Path, clears: list[str], writes: dict[str, 
     for tag, value in safe_writes.items():
         args.append(f"-{tag}={value}")
     args.extend(["-overwrite_original", str(destination)])
-    result = subprocess.run(args, capture_output=True, text=True, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags())
+    result = subprocess.run(args, capture_output=True, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags(), **EXIFTOOL_TEXT_KWARGS)
     if result.returncode != 0:
         message = result.stderr.strip() or "Failed to apply metadata update."
         logging.error("exiftool failed: %s", message)
@@ -556,7 +556,7 @@ def _existing_author_fields(report: FileReport) -> list[MetaField]:
 
 
 def _author_updates(profile: SpoofProfile, report: FileReport | None = None) -> dict[str, str]:
-    if not profile.author:
+    if profile.author is None:
         return {}
     if report is None:
         return {}
@@ -674,6 +674,7 @@ def apply_spoof(
     file_report: FileReport,
     profile: SpoofProfile,
     *,
+    output_path: Path | None = None,
     interrupt_check: Callable[[], bool] | None = None,
 ) -> Path:
     """Apply *profile* to the working copy and return its path."""
@@ -682,7 +683,11 @@ def apply_spoof(
     if not exiftool_path:
         raise RuntimeError("exiftool is required for spoofing.")
 
-    final = resolve_spoof_destination(file_report.path)
+    if output_path is not None:
+        final = Path(output_path)
+        final.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        final = resolve_spoof_destination(file_report.path)
 
     def work(destination: Path) -> None:
         clears: list[str] = []
@@ -722,7 +727,7 @@ def apply_spoof(
 
         _run_exiftool_edits(destination, list(dict.fromkeys(clears)), writes)
 
-        if file_report.file_type.lower() == "docx" and profile.author:
+        if file_report.file_type.lower() == "docx" and profile.author is not None:
             docx_author_fields = _existing_author_fields(file_report)
             if docx_author_fields:
                 _apply_docx_author(destination, profile.author, docx_author_fields)

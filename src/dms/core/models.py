@@ -31,6 +31,8 @@ class FileReport:
     warnings: list[str] = field(default_factory=list)
     empty_reason: str | None = None
     exiftool_version: str | None = None
+    analysis_status: str = "ok"
+    analysis_error: str | None = None
 
     def by_key(self) -> dict[str, MetaField]:
         """Fields keyed by full key and by short name (suffix after : or .)."""
