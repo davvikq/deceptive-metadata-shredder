@@ -1,4 +1,5 @@
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -7,11 +8,12 @@ from PySide6.QtWidgets import QApplication
 
 from dms.core.models import FileReport, MetaField
 from dms.config import get_exiftool_path
-from dms.core.analyzer import analyze
+from dms.core.analyzer import analyze, verify
 from dms.core.models import SpoofProfile
 from dms.core import spoofer as spoofer_module
 from dms.core.spoofer import (
     _existing_author_fields,
+    apply_field_spoof,
     apply_smart_spoof,
     apply_spoof,
 )
@@ -670,3 +672,176 @@ def test_batch_clean_residual_protects_spoofed_device_category(tmp_path) -> None
     assert "LensModel" not in residual_keys, "LensModel should be protected"
     assert "CreatorTool" not in residual_keys, "CreatorTool should be protected"
     assert "GPSLatitude" in residual_keys, "GPSLatitude should remain residual (not spoofed)"
+
+
+LOCATION_RESIDUE = {
+    "City": "Springfield",
+    "Sub-location": "North Wing",
+    "Country-PrimaryLocationName": "Russia",
+}
+DEVICE_RESIDUE = {
+    "XPKeywords": "private;owner",
+    "OwnerName": "Alice Owner",
+    "Rights": "Alice Rights",
+    "Headline": "Secret Headline",
+}
+RESIDUE_TAGS = {
+    "IPTC:City": LOCATION_RESIDUE["City"],
+    "IPTC:Sub-location": LOCATION_RESIDUE["Sub-location"],
+    "IPTC:Country-PrimaryLocationName": LOCATION_RESIDUE["Country-PrimaryLocationName"],
+    "EXIF:XPKeywords": DEVICE_RESIDUE["XPKeywords"],
+    "EXIF:OwnerName": DEVICE_RESIDUE["OwnerName"],
+    "XMP:Rights": DEVICE_RESIDUE["Rights"],
+    "XMP:Headline": DEVICE_RESIDUE["Headline"],
+}
+ALL_RESIDUE_KEYS = set(LOCATION_RESIDUE) | set(DEVICE_RESIDUE)
+
+
+def _seed_residue(path: Path) -> None:
+    """Write the seven leak-test fields into *path*."""
+
+    exiftool = get_exiftool_path()
+    assert exiftool, "exiftool is required for this test"
+    args = [exiftool, "-overwrite_original", "-m"]
+    args.extend(f"-{tag}={value}" for tag, value in RESIDUE_TAGS.items())
+    args.append(str(path))
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert ALL_RESIDUE_KEYS.issubset(analyze(path).by_key()), "residue seed failed"
+
+
+def _assert_residue_present(report: FileReport) -> None:
+    fields = report.by_key()
+    for key in ALL_RESIDUE_KEYS:
+        assert key in fields, f"{key} should still be present"
+    assert fields["City"].value == LOCATION_RESIDUE["City"]
+    assert fields["Rights"].value == DEVICE_RESIDUE["Rights"]
+
+
+def _assert_residue_gone(report: FileReport) -> None:
+    fields = report.by_key()
+    remaining = sorted(key for key in ALL_RESIDUE_KEYS if key in fields)
+    assert not remaining, f"residual metadata survived spoof: {remaining}"
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_guided_spoof_clears_location_and_device_residue(tmp_path) -> None:
+    """GPS + Galaxy S22 must clear all seven fields."""
+
+    source = tmp_path / "source.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+    _seed_residue(source)
+    _assert_residue_present(analyze(source))
+
+    result = apply_spoof(
+        analyze(source),
+        SpoofProfile(
+            gps_mode="manual",
+            gps_target=(48.8566, 2.3522),
+            device_make="Samsung",
+            device_model="Galaxy S22",
+            dates_mode="keep",
+        ),
+    )
+    spoofed = analyze(result)
+
+    assert spoofed.by_key()["Make"].value == "Samsung"
+    assert spoofed.by_key()["Model"].value == "Galaxy S22"
+    assert abs(float(spoofed.by_key()["GPSLatitude"].value) - 48.8566) < 0.01
+    _assert_residue_gone(spoofed)
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_guided_gps_remove_clears_location_text_only(tmp_path) -> None:
+    """GPS removal must drop GPS + textual location without touching device residue."""
+
+    source = tmp_path / "source.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+    _seed_residue(source)
+
+    result = apply_spoof(analyze(source), SpoofProfile(gps_mode="remove", dates_mode="keep"))
+    fields = analyze(result).by_key()
+
+    assert "GPSLatitude" not in fields
+    assert "GPSLongitude" not in fields
+    assert not (set(LOCATION_RESIDUE) & set(fields)), "GPS removal left textual location"
+    assert set(DEVICE_RESIDUE).issubset(fields), "GPS removal must not touch device residue"
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_smart_spoof_clears_location_and_device_residue(tmp_path) -> None:
+    source = tmp_path / "source.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+    _seed_residue(source)
+
+    result, changes, _ = apply_smart_spoof(analyze(source))
+    spoofed = analyze(result)
+
+    assert "gps" in changes
+    assert "device" in changes
+    _assert_residue_gone(spoofed)
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_field_spoof_clears_matching_residue_only(tmp_path) -> None:
+    """GUI field spoof: GPS clears place names, device clears owner/editorial."""
+
+    gps_source = tmp_path / "gps.jpg"
+    gps_source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+    _seed_residue(gps_source)
+    gps_report = analyze(gps_source)
+
+    gps_result = apply_field_spoof(gps_report, gps_report.by_key()["GPSLatitude"], (48.8566, 2.3522))
+    gps_fields = analyze(gps_result).by_key()
+    assert not (set(LOCATION_RESIDUE) & set(gps_fields)), "GPS spoof left textual location"
+    assert set(DEVICE_RESIDUE).issubset(gps_fields), "GPS spoof must not touch owner/editorial fields"
+
+    device_source = tmp_path / "device.jpg"
+    device_source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+    _seed_residue(device_source)
+    device_report = analyze(device_source)
+
+    device_result = apply_field_spoof(
+        device_report,
+        device_report.by_key()["Model"],
+        {"Make": "Samsung", "Model": "Galaxy S22", "Software": "14"},
+    )
+    device_fields = analyze(device_result).by_key()
+    assert not (set(DEVICE_RESIDUE) & set(device_fields)), "device spoof left owner/editorial residue"
+    assert set(LOCATION_RESIDUE).issubset(device_fields), "device spoof must not touch location fields"
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_dates_only_spoof_preserves_location_and_editorial_residue(tmp_path) -> None:
+    """Control: a dates-only spoof keeps IPTC/XMP as-is (narrow blast radius)."""
+
+    source = tmp_path / "source.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+    _seed_residue(source)
+    before = analyze(source).by_key()
+
+    result = apply_spoof(
+        analyze(source),
+        SpoofProfile(gps_mode="manual", gps_target=None, dates_mode="shift", dates_shift_days=-30),
+    )
+    after = analyze(result).by_key()
+
+    _assert_residue_present(analyze(result))
+    assert after["DateTimeOriginal"].value != before["DateTimeOriginal"].value
+    assert abs(float(after["GPSLatitude"].value) - float(before["GPSLatitude"].value)) < 0.01
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_verify_flags_location_and_editorial_residue(tmp_path) -> None:
+    """Newly classified fields must be visible to dms verify / residual cleanup."""
+
+    source = tmp_path / "source.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+    _seed_residue(source)
+
+    sensitive_keys = {field.key for field in verify(source)}
+    assert ALL_RESIDUE_KEYS.issubset(sensitive_keys)
+
+    for field in analyze(source).fields:
+        if field.key in ALL_RESIDUE_KEYS:
+            assert field.is_sensitive is True, f"{field.key} must be sensitive"

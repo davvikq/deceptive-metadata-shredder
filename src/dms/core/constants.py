@@ -30,6 +30,31 @@ GPS_TAGS_TO_SPOOF = [
     "GPSPosition",
 ]
 
+# Textual place tags cleared when GPS is spoofed or removed: no city database
+# exists to synthesize a matching value, so removal is the safe option.
+LOCATION_TAGS_TO_CLEAR = [
+    "IPTC:All",
+    "XMP:City",
+    "XMP:State",
+    "XMP:Country",
+    "XMP:Location",
+    "XMP:CountryCode",
+    "XMP-iptcExt:LocationShown",
+    "XMP-iptcExt:LocationCreated",
+]
+
+# Owner/editorial tags cleared together with DEVICE_TAGS_TO_CLEAR.
+DEVICE_RESIDUE_TAGS_TO_CLEAR = [
+    "EXIF:XPAuthor",
+    "EXIF:XPComment",
+    "EXIF:XPKeywords",
+    "EXIF:XPSubject",
+    "EXIF:XPTitle",
+    "EXIF:OwnerName",
+    "XMP:Rights",
+    "XMP:Headline",
+]
+
 DEVICE_TAGS_TO_CLEAR = [
     "Make",
     "Model",
@@ -269,6 +294,19 @@ SENSITIVE_EXACT_TAGS = {
     "ImageUniqueID",
     "LensModel",
     "LensID",
+    # Location descriptors (IPTC/XMP): de-anonymizing even without GPS.
+    "City",
+    "State",
+    "Sub-location",
+    "Country",
+    "CountryCode",
+    "Country-PrimaryLocationName",
+    "Province-State",
+    "Location",
+    # Owner/editorial residue removed on device spoof.
+    "XPKeywords",
+    "Rights",
+    "Headline",
 }
 
 SENSITIVE_PARTIAL_TAGS = (
@@ -277,6 +315,8 @@ SENSITIVE_PARTIAL_TAGS = (
     "Created",
     "Modified",
     "RegionExtensions",
+    "LocationShown",
+    "LocationCreated",
 )
 
 # Biometric / hardware fingerprint tags — remove only, never spoof.

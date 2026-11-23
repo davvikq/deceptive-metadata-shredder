@@ -17,8 +17,10 @@ from dms.core.constants import (
     ALWAYS_DELETE_PREFIXES,
     ALWAYS_DELETE_TAGS,
     DATE_FIELD_KEYS,
+    DEVICE_RESIDUE_TAGS_TO_CLEAR,
     DEVICE_TAGS_TO_CLEAR,
     GPS_TAGS_TO_SPOOF,
+    LOCATION_TAGS_TO_CLEAR,
     REGION_XMP_NUKE_ARGS,
     SUBSEC_TAGS,
 )
@@ -621,7 +623,7 @@ def apply_field_spoof(
         if field.category == "gps":
             lat = float(new_value["GPSLatitude"]) if isinstance(new_value, dict) else float(new_value[0])
             lon = float(new_value["GPSLongitude"]) if isinstance(new_value, dict) else float(new_value[1])
-            clears = list(GPS_TAGS_TO_SPOOF)
+            clears = list(GPS_TAGS_TO_SPOOF) + list(LOCATION_TAGS_TO_CLEAR)
             writes = {
                 "GPSLatitude": round(lat, 6),
                 "GPSLongitude": round(lon, 6),
@@ -631,7 +633,7 @@ def apply_field_spoof(
                 "GPSAltitudeRef": 0,
             }
         elif field.category == "device":
-            clears = list(DEVICE_TAGS_TO_CLEAR)
+            clears = list(DEVICE_TAGS_TO_CLEAR) + list(DEVICE_RESIDUE_TAGS_TO_CLEAR)
             raw_writes = dict(new_value) if isinstance(new_value, dict) else {field.exiftool_tag: new_value}
             writes = {
                 tag: value for tag, value in raw_writes.items()
@@ -690,9 +692,11 @@ def apply_spoof(
         gps_target = _resolve_gps_target(file_report, profile)
         if has_gps_metadata and profile.gps_mode == "remove":
             clears.extend(GPS_TAGS_TO_SPOOF)
+            clears.extend(LOCATION_TAGS_TO_CLEAR)
         elif has_gps_metadata and gps_target:
             lat, lon = gps_target
             clears.extend(GPS_TAGS_TO_SPOOF)
+            clears.extend(LOCATION_TAGS_TO_CLEAR)
             writes.update(
                 {
                     "GPSLatitude": round(lat, 6),
@@ -707,6 +711,7 @@ def apply_spoof(
         device_updates = _device_updates(profile, report=file_report)
         if device_updates:
             clears.extend(DEVICE_TAGS_TO_CLEAR)
+            clears.extend(DEVICE_RESIDUE_TAGS_TO_CLEAR)
             writes.update(device_updates)
             existing_profile_creator = _get_field_value(file_report, "ProfileCreator")
             if str(existing_profile_creator).lower() == "appl" and "ProfileCreator" not in writes:
@@ -794,7 +799,7 @@ def apply_smart_spoof(
                     lat, lon = geo_validator.smart_spoof(float(gps_lat.value), float(gps_lon.value))
                     if _run_exiftool_edits(
                         destination,
-                        list(GPS_TAGS_TO_SPOOF),
+                        list(GPS_TAGS_TO_SPOOF) + list(LOCATION_TAGS_TO_CLEAR),
                         {
                             "GPSLatitude": round(lat, 6),
                             "GPSLongitude": round(lon, 6),
@@ -836,7 +841,12 @@ def apply_smart_spoof(
                     existing_profile_creator = _get_field_value(file_report, "ProfileCreator")
                     if str(existing_profile_creator).lower() == "appl" and "ProfileCreator" not in device_updates:
                         device_updates["ProfileCreator"] = _spoofed_profile_creator(existing_profile_creator)
-                    if _run_exiftool_edits(destination, list(DEVICE_TAGS_TO_CLEAR), device_updates, soft_fail=True):
+                    if _run_exiftool_edits(
+                        destination,
+                        list(DEVICE_TAGS_TO_CLEAR) + list(DEVICE_RESIDUE_TAGS_TO_CLEAR),
+                        device_updates,
+                        soft_fail=True,
+                    ):
                         changes.append("device")
                     else:
                         add_info("smart_spoof_partial_device_failed")
