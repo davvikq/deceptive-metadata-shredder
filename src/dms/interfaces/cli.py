@@ -292,10 +292,16 @@ def _report_diff(before: FileReport, after: FileReport) -> tuple[set[str], set[s
     return changed, removed
 
 
+def _effective_category(field: MetaField) -> str:
+    if field.category == "gps" or field.key.startswith("GPS"):
+        return "gps"
+    return field.category
+
+
 def _changed_categories(before: FileReport, after: FileReport, keys: set[str]) -> list[str]:
     order = ["gps", "device", "author", "dates", "other"]
     present = {
-        field.category
+        _effective_category(field)
         for report in (before, after)
         for field in report.fields
         if field.key in keys

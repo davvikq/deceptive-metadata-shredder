@@ -28,7 +28,7 @@ from dms.core.device_db import get_all_devices, get_models_by_make, get_random_d
 from dms.core.exiftool_tags import validate_exif_tag
 from dms.core.models import FileReport, MetaField, SpoofProfile, parse_metadata_datetime
 from dms.core.sanitizer import repack_docx_zip_dates, resolve_spoof_destination, run_atomic_file_update
-from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags, remove_exiftool_signature
+from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags, remove_exiftool_signature, run_exiftool_with_argfile
 
 _PROFILE_CREATOR_POOL = ("MSFT", "GOOG", "ADBE", "SUNW")
 
@@ -353,12 +353,9 @@ def _run_exiftool_edits(destination: Path, clears: list[str], writes: dict[str, 
     if not safe_clears and not safe_writes:
         return True
     exiftool_path = require_exiftool()
-    args = [exiftool_path]
-    args.extend(f"-{tag}=" for tag in safe_clears)
-    for tag, value in safe_writes.items():
-        args.append(f"-{tag}={value}")
-    args.extend(["-overwrite_original", str(destination)])
-    result = subprocess.run(args, capture_output=True, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags(), **EXIFTOOL_TEXT_KWARGS)
+    options = [f"-{tag}=" for tag in safe_clears]
+    options.extend(f"-{tag}={value}" for tag, value in safe_writes.items())
+    result = run_exiftool_with_argfile(exiftool_path, destination, options)
     if result.returncode != 0:
         message = result.stderr.strip() or "Failed to apply metadata update."
         logging.error("exiftool failed: %s", message)
@@ -392,6 +389,43 @@ def _resolve_spoof_anchor_date(report: FileReport, profile: SpoofProfile) -> dat
         return now - timedelta(days=random.randint(30, 2000))
     base_date = _resolve_date_value(report)[0] or now
     return base_date + timedelta(days=profile.dates_shift_days)
+
+
+def _gps_timestamp_updates(when: datetime) -> dict[str, object]:
+    """UTC GPS date/time consistent with the spoofed capture date."""
+
+    utc = when.astimezone(timezone.utc).replace(tzinfo=None) if when.tzinfo else when
+    return {
+        "GPSDateStamp": utc.strftime("%Y:%m:%d"),
+        "GPSTimeStamp": utc.strftime("%H:%M:%S"),
+    }
+
+
+def _gps_writes(
+    lat: float,
+    lon: float,
+    report: FileReport,
+    when: datetime | None = None,
+    *,
+    include_time: bool = True,
+) -> dict[str, object]:
+    """GPS fields for a spoofed position.
+
+    Altitude is cleared instead of written as 0: an exact sea-level altitude is
+    less plausible than a missing altitude, and GPS time is always included so
+    the result matches what a phone would normally record.
+    """
+
+    writes: dict[str, object] = {
+        "GPSLatitude": round(lat, 6),
+        "GPSLongitude": round(lon, 6),
+        "GPSLatitudeRef": "N" if lat >= 0 else "S",
+        "GPSLongitudeRef": "E" if lon >= 0 else "W",
+    }
+    if include_time:
+        timestamp = when or _resolve_date_value(report)[0] or datetime.now(timezone.utc).replace(tzinfo=None)
+        writes.update(_gps_timestamp_updates(timestamp))
+    return writes
 
 
 def _resolve_gps_target(report: FileReport, profile: SpoofProfile) -> tuple[float, float] | None:
@@ -624,14 +658,7 @@ def apply_field_spoof(
             lat = float(new_value["GPSLatitude"]) if isinstance(new_value, dict) else float(new_value[0])
             lon = float(new_value["GPSLongitude"]) if isinstance(new_value, dict) else float(new_value[1])
             clears = list(GPS_TAGS_TO_SPOOF) + list(LOCATION_TAGS_TO_CLEAR)
-            writes = {
-                "GPSLatitude": round(lat, 6),
-                "GPSLongitude": round(lon, 6),
-                "GPSLatitudeRef": "N" if lat >= 0 else "S",
-                "GPSLongitudeRef": "E" if lon >= 0 else "W",
-                "GPSAltitude": 0,
-                "GPSAltitudeRef": 0,
-            }
+            writes = _gps_writes(lat, lon, file_report)
         elif field.category == "device":
             clears = list(DEVICE_TAGS_TO_CLEAR) + list(DEVICE_RESIDUE_TAGS_TO_CLEAR)
             raw_writes = dict(new_value) if isinstance(new_value, dict) else {field.exiftool_tag: new_value}
@@ -693,6 +720,10 @@ def apply_spoof(
         clears: list[str] = []
         writes: dict[str, object] = {}
 
+        dates_anchor: datetime | None = None
+        if profile.dates_mode not in {"keep", "remove"}:
+            dates_anchor = _resolve_spoof_anchor_date(file_report, profile)
+
         has_gps_metadata = _find_gps_field(file_report) is not None
         gps_target = _resolve_gps_target(file_report, profile)
         if has_gps_metadata and profile.gps_mode == "remove":
@@ -703,14 +734,13 @@ def apply_spoof(
             clears.extend(GPS_TAGS_TO_SPOOF)
             clears.extend(LOCATION_TAGS_TO_CLEAR)
             writes.update(
-                {
-                    "GPSLatitude": round(lat, 6),
-                    "GPSLongitude": round(lon, 6),
-                    "GPSLatitudeRef": "N" if lat >= 0 else "S",
-                    "GPSLongitudeRef": "E" if lon >= 0 else "W",
-                    "GPSAltitude": 0,
-                    "GPSAltitudeRef": 0,
-                }
+                _gps_writes(
+                    lat,
+                    lon,
+                    file_report,
+                    dates_anchor,
+                    include_time=profile.dates_mode != "remove",
+                )
             )
 
         device_updates = _device_updates(profile, report=file_report)
@@ -738,10 +768,14 @@ def apply_spoof(
                 _apply_dates_to_destination(destination, file_report, None, remove=True)
                 fs_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=random.randint(180, 2000))
             else:
-                anchor = _resolve_spoof_anchor_date(file_report, profile)
-                if not _apply_dates_to_destination(destination, file_report, anchor, remove=False):
+                if not _apply_dates_to_destination(
+                    destination,
+                    file_report,
+                    dates_anchor or _resolve_spoof_anchor_date(file_report, profile),
+                    remove=False,
+                ):
                     raise RuntimeError("Failed to update date metadata.")
-                fs_date = anchor
+                fs_date = dates_anchor
 
         remove_exiftool_signature(destination, exiftool_path)
         if fs_date is not None:
@@ -791,6 +825,16 @@ def apply_smart_spoof(
             progress_callback(message)
 
     def work(destination: Path) -> None:
+        has_dates = any(
+            ("date" in field.key.lower() or "time" in field.key.lower()) and field.is_sensitive
+            for field in file_report.fields
+        )
+        dates_anchor: datetime | None = None
+        if has_dates:
+            shift_days = -random.randint(180, 1000)
+            base_date = _resolve_date_value(file_report)[0] or datetime.now(timezone.utc).replace(tzinfo=None)
+            dates_anchor = base_date + timedelta(days=shift_days)
+
         gps_lat = _find_field(file_report, "gpslatitude")
         gps_lon = _find_field(file_report, "gpslongitude")
         if gps_lat and gps_lon and gps_lat.value not in (None, "") and gps_lon.value not in (None, ""):
@@ -805,14 +849,7 @@ def apply_smart_spoof(
                     if _run_exiftool_edits(
                         destination,
                         list(GPS_TAGS_TO_SPOOF) + list(LOCATION_TAGS_TO_CLEAR),
-                        {
-                            "GPSLatitude": round(lat, 6),
-                            "GPSLongitude": round(lon, 6),
-                            "GPSLatitudeRef": "N" if lat >= 0 else "S",
-                            "GPSLongitudeRef": "E" if lon >= 0 else "W",
-                            "GPSAltitude": 0,
-                            "GPSAltitudeRef": 0,
-                        },
+                        _gps_writes(lat, lon, file_report, dates_anchor),
                         soft_fail=True,
                     ):
                         changes.append("gps")
@@ -863,20 +900,11 @@ def apply_smart_spoof(
                 logging.error("Smart spoof device failed: %s", exc, exc_info=True)
                 add_info("smart_spoof_partial_device_failed")
 
-        has_dates = any(
-            ("date" in field.key.lower() or "time" in field.key.lower()) and field.is_sensitive
-            for field in file_report.fields
-        )
-        dates_anchor: datetime | None = None
         if has_dates:
             progress("Spoofing dates...")
             try:
-                shift_days = -random.randint(180, 1000)
-                base_date = _resolve_date_value(file_report)[0] or datetime.now(timezone.utc).replace(tzinfo=None)
-                anchor = base_date + timedelta(days=shift_days)
-                if _apply_dates_to_destination(destination, file_report, anchor, remove=False):
+                if dates_anchor and _apply_dates_to_destination(destination, file_report, dates_anchor, remove=False):
                     changes.append("dates")
-                    dates_anchor = anchor
                 else:
                     add_info("smart_spoof_partial_dates_failed")
             except Exception as exc:

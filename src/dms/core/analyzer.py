@@ -7,6 +7,7 @@ import json
 import logging
 import subprocess
 import zipfile
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -263,29 +264,39 @@ def _safe_append(
 def _analyze_with_exiftool(path: Path) -> list[MetaField]:
     raw = _run_exiftool_json(path)
     fields: list[MetaField] = []
-    seen_keys: dict[str, set[str]] = {}
-    _append_grouped_fields(fields, raw, seen_keys, file_type=detect_file_type(path))
+    seen_tags: set[str] = set()
+    seen_keys: set[str] = set()
+    _append_grouped_fields(fields, raw, seen_tags, seen_keys, file_type=detect_file_type(path))
     return fields
 
 
-def _is_duplicate_field(normalized_key: str, value: Any, seen_tags: dict[str, set[str]]) -> bool:
-    seen_values = seen_tags.get(normalized_key)
-    if seen_values is None:
-        seen_tags[normalized_key] = {str(value)}
-        return False
-    if not _is_sensitive_key(normalized_key):
+def _is_duplicate_field(
+    field_tag: str,
+    normalized_key: str,
+    seen_tags: set[str],
+    seen_keys: set[str],
+) -> bool:
+    """Keep different group variants (e.g. IFD0:Software and XMP-tiff:Software).
+
+    Only exact tags repeat, plus Composite values that merely derive from a tag
+    already present in the report.
+    """
+
+    identity = field_tag.lower()
+    if identity in seen_tags:
         return True
-    value_repr = str(value)
-    if value_repr in seen_values:
+    seen_tags.add(identity)
+    if field_tag.startswith("Composite:") and normalized_key in seen_keys:
         return True
-    seen_values.add(value_repr)
+    seen_keys.add(normalized_key)
     return False
 
 
 def _append_grouped_fields(
     fields: list[MetaField],
     payload: dict[str, Any],
-    seen_tags: dict[str, set[str]],
+    seen_tags: set[str],
+    seen_keys: set[str],
     parents: tuple[str, ...] = (),
     file_type: str | None = None,
 ) -> None:
@@ -293,18 +304,18 @@ def _append_grouped_fields(
         if isinstance(value, dict) and "val" in value:
             field_tag = ".".join((*parents, key)) if parents else key
             normalized_key = _normalized_tag_name(field_tag)
-            if _is_duplicate_field(normalized_key, value.get("val"), seen_tags):
+            if _is_duplicate_field(field_tag, normalized_key, seen_tags, seen_keys):
                 continue
             _safe_append(fields, field_tag, value.get("val"), label_override=value.get("desc"), file_type=file_type)
             continue
 
         if isinstance(value, dict):
-            _append_grouped_fields(fields, value, seen_tags, parents + (key,), file_type=file_type)
+            _append_grouped_fields(fields, value, seen_tags, seen_keys, parents + (key,), file_type=file_type)
             continue
 
         field_tag = ".".join((*parents, key)) if parents else key
         normalized_key = _normalized_tag_name(field_tag)
-        if _is_duplicate_field(normalized_key, value, seen_tags):
+        if _is_duplicate_field(field_tag, normalized_key, seen_tags, seen_keys):
             continue
         _safe_append(fields, field_tag, value, file_type=file_type)
 
@@ -446,10 +457,11 @@ def _analyze_pdf(path: Path) -> tuple[list[MetaField], str, str | None]:
     status = "ok"
     error: str | None = None
     if get_exiftool_path():
-        seen_keys: dict[str, set[str]] = {}
+        seen_tags: set[str] = set()
+        seen_keys: set[str] = set()
         try:
-            _append_grouped_fields(fields, _run_exiftool_json(path), seen_keys)
-            _append_grouped_fields(fields, _run_exiftool_pdf_json(path), seen_keys)
+            _append_grouped_fields(fields, _run_exiftool_json(path), seen_tags, seen_keys)
+            _append_grouped_fields(fields, _run_exiftool_pdf_json(path), seen_tags, seen_keys)
         except (RuntimeError, subprocess.SubprocessError, OSError, json.JSONDecodeError, MetadataAnalysisError) as exc:
             status = "partial"
             error = f"exiftool PDF read failed: {exc}"
@@ -570,6 +582,12 @@ def _build_report(
     analysis_status: str = "ok",
     analysis_error: str | None = None,
 ) -> FileReport:
+    counts = Counter(field.key for field in fields)
+    for field in fields:
+        if counts[field.key] > 1:
+            group = field.exiftool_tag.split(":", 1)[0]
+            if not field.label.endswith(f"({group})"):
+                field.label = f"{field.label} ({group})"
     empty_reason = None
     if not fields:
         empty_reason = (

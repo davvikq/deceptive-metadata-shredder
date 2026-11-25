@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 EXIFTOOL_TIMEOUT = 120
@@ -20,6 +21,34 @@ def get_subprocess_flags() -> int:
     if sys.platform == "win32":
         return subprocess.CREATE_NO_WINDOW
     return 0
+
+
+def run_exiftool_with_argfile(
+    exiftool_path: str,
+    destination: Path,
+    options: list[str],
+) -> subprocess.CompletedProcess[str]:
+    """Run exiftool with options from a UTF-8 argfile.
+
+    Windows exiftool.exe passes argv through an ANSI layer, which corrupts
+    non-ASCII values. A UTF-8 argfile preserves them for EXIF and XMP writes.
+    """
+
+    payload = ("\n".join(options) + "\n").encode("utf-8")
+    fd, argfile_name = tempfile.mkstemp(prefix=".dms_args_", suffix=".txt")
+    argfile = Path(argfile_name)
+    try:
+        with open(fd, "wb") as handle:
+            handle.write(payload)
+        return subprocess.run(
+            [exiftool_path, "-@", str(argfile), "-overwrite_original", str(destination)],
+            capture_output=True,
+            timeout=EXIFTOOL_TIMEOUT,
+            creationflags=get_subprocess_flags(),
+            **EXIFTOOL_TEXT_KWARGS,
+        )
+    finally:
+        argfile.unlink(missing_ok=True)
 
 
 def remove_exiftool_signature(file_path: Path, exiftool_path: str) -> None:

@@ -118,3 +118,39 @@ def test_analyze_json_reports_status(tmp_path) -> None:
     payload = json.loads(result.output)
     assert payload["status"] == "dirty"
     assert payload["analysis_status"] == "ok"
+
+
+def test_residual_cleanup_removes_all_group_variants(tmp_path) -> None:
+    from dms.config import get_exiftool_path
+    import subprocess
+
+    exiftool = get_exiftool_path()
+    if not exiftool:
+        return
+    source = _copy_fixture(tmp_path)
+    subprocess.run(
+        [
+            exiftool,
+            "-overwrite_original",
+            "-m",
+            "-IFD0:Software=DMS Test",
+            "-XMP-tiff:Software=DMS Test",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["spoof", str(source), "--gps", "remove", "--dates", "keep", "--residual", "--yes"],
+    )
+
+    assert result.exit_code == 0
+    spoofed = source.with_name(f"{source.stem}_spoofed{source.suffix}")
+    software = {
+        field.exiftool_tag
+        for field in analyze(spoofed).fields
+        if field.key == "Software"
+    }
+    assert software == set()

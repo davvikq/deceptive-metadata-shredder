@@ -81,6 +81,90 @@ def test_output_file_contains_new_coordinates(tmp_path) -> None:
     assert abs(float(spoofed["GPSLongitude"].value) - 2.3522) < 0.01
 
 
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_gps_spoof_writes_consistent_time_without_zero_altitude(tmp_path) -> None:
+    source = tmp_path / "source.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+
+    result = apply_spoof(
+        analyze(source),
+        SpoofProfile(gps_mode="manual", gps_target=(48.8566, 2.3522), dates_mode="shift", dates_shift_days=-400),
+    )
+    fields = analyze(result).by_key()
+
+    assert "GPSDateStamp" in fields
+    assert "GPSTimeStamp" in fields
+    assert "GPSAltitude" not in fields
+    assert "GPSAltitudeRef" not in fields
+    assert fields["GPSDateStamp"].value == str(fields["DateTimeOriginal"].value).split()[0]
+    gps_time = str(fields["GPSTimeStamp"].value)
+    capture_time = str(fields["DateTimeOriginal"].value).split()[1][:8]
+    assert gps_time == capture_time
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_gps_spoof_time_matches_kept_capture_date(tmp_path) -> None:
+    source = tmp_path / "source.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+
+    result = apply_spoof(
+        analyze(source),
+        SpoofProfile(gps_mode="manual", gps_target=(48.8566, 2.3522), dates_mode="keep"),
+    )
+    fields = analyze(result).by_key()
+
+    assert fields["GPSDateStamp"].value == "2024:04:18"
+    assert fields["GPSTimeStamp"].value == "10:22:33"
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_smart_spoof_keeps_gps_time_in_sync_with_dates(tmp_path) -> None:
+    source = tmp_path / "source.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+
+    result, changes, _ = apply_smart_spoof(analyze(source))
+    fields = analyze(result).by_key()
+
+    assert {"gps", "dates"} <= set(changes)
+    assert "GPSAltitude" not in fields
+    assert fields["GPSDateStamp"].value == str(fields["DateTimeOriginal"].value).split()[0]
+    gps_time = str(fields["GPSTimeStamp"].value)
+    capture_time = str(fields["DateTimeOriginal"].value).split()[1][:8]
+    assert gps_time == capture_time
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_non_ascii_author_is_written_through_argfile(tmp_path) -> None:
+    source = tmp_path / "source.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+    subprocess.run(
+        [
+            get_exiftool_path(),
+            "-overwrite_original",
+            "-m",
+            "-EXIF:Artist=Alice",
+            "-XMP-dc:Creator=Alice",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    result = apply_spoof(
+        analyze(source),
+        SpoofProfile(
+            gps_mode="manual",
+            gps_target=None,
+            author="\u0418\u0432\u0430\u043d \u041f\u0435\u0442\u0440\u043e\u0432",
+            dates_mode="keep",
+        ),
+    )
+    fields = analyze(result).by_key()
+
+    assert fields["Artist"].value == "\u0418\u0432\u0430\u043d \u041f\u0435\u0442\u0440\u043e\u0432"
+    assert fields["Creator"].value == "\u0418\u0432\u0430\u043d \u041f\u0435\u0442\u0440\u043e\u0432"
+
+
 def test_raw_owner_and_serial_are_spoofed_when_present(tmp_path, monkeypatch) -> None:
     source = tmp_path / "source.dng"
     source.write_bytes(b"raw-source")

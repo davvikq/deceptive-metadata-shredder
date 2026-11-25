@@ -1,7 +1,9 @@
 from pathlib import Path
+import subprocess
 
 import piexif
 
+from dms.config import get_exiftool_path
 from dms.core import analyzer
 from dms.core.analyzer import analyze, _safe_append
 
@@ -127,3 +129,28 @@ def test_zip_container_timestamps_are_not_sensitive() -> None:
     _safe_append(fields, "ZIP:ZipCreateDate", "1980:01:01 00:00:00")
 
     assert [field.is_sensitive for field in fields] == [False, False]
+
+
+def test_same_tag_name_in_different_groups_is_not_deduplicated(tmp_path) -> None:
+    exiftool = get_exiftool_path()
+    if not exiftool:
+        return
+    source = tmp_path / "duplicate.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+    subprocess.run(
+        [
+            exiftool,
+            "-overwrite_original",
+            "-m",
+            "-IFD0:Software=DMS Test",
+            "-XMP-tiff:Software=DMS Test",
+            str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    report = analyze(source)
+    software_tags = {field.exiftool_tag for field in report.fields if field.key == "Software"}
+
+    assert {"IFD0:Software", "XMP-tiff:Software"} <= software_tags
