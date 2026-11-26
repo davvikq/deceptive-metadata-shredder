@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Callable
 
 from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
 
 from dms.core import analyzer
 from dms.core.sanitizer import remove_all
@@ -118,31 +117,3 @@ class DMSEventHandler(FileSystemEventHandler):
         if self.should_ignore(event.src_path):
             return
         self._task_queue.put(Path(event.src_path))
-
-
-def watch_folder(
-    folder: Path,
-    mode: str = "clean",
-    recursive: bool = False,
-    callback: WatchCallback | None = None,
-    output_dir: Path | None = None,
-    include_all: bool = False,
-) -> None:
-    """Start watching a folder until interrupted."""
-
-    folder_path = Path(folder)
-    folder_path.mkdir(parents=True, exist_ok=True)
-    observer = Observer()
-    observer.daemon = True
-    observer.schedule(
-        DMSEventHandler(mode=mode, callback=callback, output_dir=output_dir, include_all=include_all),
-        str(folder_path),
-        recursive=recursive,
-    )
-    observer.start()
-    try:
-        while True:
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
