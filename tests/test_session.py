@@ -126,3 +126,117 @@ def test_risk_score_recalculates_from_field_status(tmp_path) -> None:
         assert report.by_key()["ImageWidth"].status == "clean"
     finally:
         window.close()
+
+
+def test_gui_get_log_path_falls_back_to_temp_on_permission_error(tmp_path, monkeypatch) -> None:
+    import tempfile
+    from dms.interfaces.gui import app as gui_app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gui_app.sys, "frozen", False, raising=False)
+
+    orig_touch = Path.touch
+
+    def deny_cwd_touch(self, *args, **kwargs):
+        if self.parent == tmp_path:
+            raise PermissionError("read-only")
+        return orig_touch(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "touch", deny_cwd_touch)
+
+    log_path = gui_app.get_log_path()
+    assert log_path == Path(tempfile.gettempdir()) / "dms_errors.log"
+
+
+def test_cleanup_stale_temp_dirs_removes_dead_pid_and_keeps_live_pid(tmp_path) -> None:
+    from dms.interfaces.gui.app import cleanup_stale_temp_dirs
+
+    dead_dir = tmp_path / "dms_dead123"
+    dead_dir.mkdir()
+    (dead_dir / ".dms.pid").write_text("99999999", encoding="utf-8")
+    (dead_dir / "leak.jpg").write_bytes(b"secret")
+
+    live_dir = tmp_path / "dms_live123"
+    live_dir.mkdir()
+    (live_dir / ".dms.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+    removed = cleanup_stale_temp_dirs(tmp_path)
+
+    assert removed == 1
+    assert not dead_dir.exists()
+    assert live_dir.exists()
+
+
+def test_plan_batch_destinations_handles_spoof_suffix_and_name_collisions(tmp_path) -> None:
+    from dms.interfaces.gui.app import _plan_batch_destinations
+
+    s1 = FileSession(
+        original_path=tmp_path / "dir1" / "photo.jpg",
+        work_path=tmp_path / "w1.jpg",
+        original_report=_report(tmp_path / "w1.jpg", []),
+        current_report=_report(tmp_path / "w1.jpg", []),
+        output_suffix="spoofed",
+    )
+    s2 = FileSession(
+        original_path=tmp_path / "dir2" / "photo.jpg",
+        work_path=tmp_path / "w2.jpg",
+        original_report=_report(tmp_path / "w2.jpg", []),
+        current_report=_report(tmp_path / "w2.jpg", []),
+        output_suffix="spoofed",
+    )
+
+    out_dir = tmp_path / "out"
+    plan = _plan_batch_destinations([s1, s2], out_dir)
+
+    assert [dest.name for _, dest in plan] == ["photo_spoofed.jpg", "photo_2_spoofed.jpg"]
+
+
+def test_open_batch_defers_temp_copy_from_ui_thread(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        f1 = tmp_path / "a.jpg"
+        f2 = tmp_path / "b.jpg"
+        f1.write_bytes(b"a")
+        f2.write_bytes(b"b")
+
+        window.open_batch([f1, f2])
+
+        assert len(window.batch_sessions) == 2
+        assert all(s.temp_dir is None for s in window.batch_sessions)
+    finally:
+        window.close()
+
+
+def test_save_all_batch_prompts_before_overwriting_existing_files(tmp_path, monkeypatch) -> None:
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        existing = out_dir / "photo_spoofed.jpg"
+        existing.write_bytes(b"KEEP_EXISTING")
+
+        work = tmp_path / "work.jpg"
+        work.write_bytes(b"NEW_DATA")
+        window.batch_sessions = [
+            FileSession(
+                original_path=tmp_path / "photo.jpg",
+                work_path=work,
+                original_report=_report(work, []),
+                current_report=_report(work, []),
+                is_modified=True,
+                output_suffix="spoofed",
+            )
+        ]
+
+        monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(out_dir))
+        monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.No)
+
+        assert window.save_all_batch() is False
+        assert existing.read_bytes() == b"KEEP_EXISTING"
+        assert window.batch_sessions[0].is_modified is True
+    finally:
+        window.close()

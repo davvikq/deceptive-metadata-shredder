@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import re
@@ -9,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import copy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +19,7 @@ from PySide6.QtCore import QPoint, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QKeyEvent, QMouseEvent, QPainter, QPalette, QRadialGradient
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -37,7 +40,7 @@ from dms.core.models import FileReport, MetaField, parse_metadata_datetime
 from dms.core.constants import ALWAYS_DELETE_PREFIXES, ALWAYS_DELETE_TAGS, REGION_XMP_NUKE_ARGS
 from dms.core.exiftool_tags import validate_exif_tag
 from dms.core.sanitizer import remove_all, remove_field
-from dms.core.utils import EXIFTOOL_TEXT_KWARGS, get_subprocess_flags, remove_exiftool_signature
+from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags, remove_exiftool_signature
 from dms.config import require_exiftool
 from dms.core.spoofer import apply_field_spoof, apply_smart_spoof, set_filesystem_dates, spoof_filesystem_dates
 from dms.interfaces.gui.screens.screen_batch import ScreenBatch
@@ -49,7 +52,101 @@ from dms.interfaces.gui.widgets.glass_card import GlassCard
 from dms.interfaces.gui.widgets.toast import Toast
 
 # Max time to wait for QThread workers to finish after requestInterruption() on window close.
-_CLOSE_JOIN_TIMEOUT_MS = 30_000
+_CLOSE_JOIN_TIMEOUT_MS = 5_000
+_STALE_TEMP_MAX_AGE_SECONDS = 24 * 3600
+_ACTIVE_TEMP_DIRS: set[Path] = set()
+
+
+def _cleanup_registered_temp_dirs() -> None:
+    for temp_dir in list(_ACTIVE_TEMP_DIRS):
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        _ACTIVE_TEMP_DIRS.discard(temp_dir)
+
+
+atexit.register(_cleanup_registered_temp_dirs)
+
+
+def _create_tracked_temp_dir() -> Path:
+    temp_dir = Path(tempfile.mkdtemp(prefix="dms_"))
+    try:
+        (temp_dir / ".dms.pid").write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+    _ACTIVE_TEMP_DIRS.add(temp_dir)
+    return temp_dir
+
+
+def _remove_tracked_temp_dir(temp_dir: Path | None) -> None:
+    if temp_dir is None:
+        return
+    _ACTIVE_TEMP_DIRS.discard(temp_dir)
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform.startswith("win"):
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ctypes.windll.kernel32.GetLastError() == 5
+        try:
+            exit_code = ctypes.c_ulong()
+            if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return exit_code.value == 259
+            return True
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def cleanup_stale_temp_dirs(base_dir: Path | None = None) -> int:
+    """Remove leftover dms_* temp directories whose owning process has exited."""
+
+    root = base_dir or Path(tempfile.gettempdir())
+    removed = 0
+    now = time.time()
+    try:
+        candidates = list(root.glob("dms_*"))
+    except OSError:
+        return 0
+    for entry in candidates:
+        if not entry.is_dir() or entry in _ACTIVE_TEMP_DIRS:
+            continue
+        pid_file = entry / ".dms.pid"
+        should_remove = False
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text(encoding="utf-8").strip())
+                if pid != os.getpid() and not _pid_is_alive(pid):
+                    should_remove = True
+            except (OSError, ValueError):
+                should_remove = True
+        else:
+            try:
+                if now - entry.stat().st_mtime > _STALE_TEMP_MAX_AGE_SECONDS:
+                    should_remove = True
+            except OSError:
+                should_remove = False
+        if should_remove:
+            try:
+                shutil.rmtree(entry, ignore_errors=True)
+                if not entry.exists():
+                    removed += 1
+            except OSError:
+                pass
+    return removed
 
 # Adaptive min/start size vs QGuiApplication.primaryScreen().availableGeometry() so the
 # Windows title bar is not clipped on e.g. 1366x768 with taskbar (see _center_on_screen).
@@ -194,6 +291,23 @@ class FileSession:
     temp_dir: Path | None = None
     is_modified: bool = False
     spoofed_dates_anchor: datetime | None = None
+    output_suffix: str = "cleaned"
+
+
+def _plan_batch_destinations(sessions: list[FileSession], output_dir: Path) -> list[tuple[FileSession, Path]]:
+    planned: list[tuple[FileSession, Path]] = []
+    used: set[str] = set()
+    for session in sessions:
+        orig = session.original_path
+        suffix = session.output_suffix or "cleaned"
+        candidate = output_dir / f"{orig.stem}_{suffix}{orig.suffix}"
+        counter = 2
+        while candidate.name.lower() in used:
+            candidate = output_dir / f"{orig.stem}_{counter}_{suffix}{orig.suffix}"
+            counter += 1
+        used.add(candidate.name.lower())
+        planned.append((session, candidate))
+    return planned
 
 
 LINKED_TAGS = {
@@ -335,7 +449,9 @@ def _nuke_region_blocks(target: Path) -> None:
     args.extend(REGION_XMP_NUKE_ARGS)
     args.append(str(target))
     subprocess.run(
-        args, capture_output=True,
+        args,
+        capture_output=True,
+        timeout=EXIFTOOL_TIMEOUT,
         creationflags=get_subprocess_flags(),
         **EXIFTOOL_TEXT_KWARGS,
     )
@@ -349,14 +465,29 @@ def get_log_path() -> Path:
         log_dir = app_data / "DeceptiveMetadataShredder"
         log_dir.mkdir(parents=True, exist_ok=True)
         return log_dir / "dms_errors.log"
-    return Path(__file__).parent.parent.parent / "dms_errors.log"
+    cwd_log = Path.cwd() / "dms_errors.log"
+    try:
+        cwd_log.touch(exist_ok=True)
+        return cwd_log
+    except OSError:
+        return Path(tempfile.gettempdir()) / "dms_errors.log"
 
 
 def configure_logging() -> None:
-    """Append ERROR logs to a writable path (AppData when frozen)."""
+    """Append ERROR logs to a writable path (AppData when frozen, temp fallback)."""
 
+    for candidate in (get_log_path(), Path(tempfile.gettempdir()) / "dms_errors.log"):
+        try:
+            logging.basicConfig(
+                filename=str(candidate),
+                level=logging.ERROR,
+                format="%(asctime)s — %(levelname)s — %(message)s",
+                force=True,
+            )
+            return
+        except OSError:
+            continue
     logging.basicConfig(
-        filename=str(get_log_path()),
         level=logging.ERROR,
         format="%(asctime)s — %(levelname)s — %(message)s",
         force=True,
@@ -418,6 +549,9 @@ class WorkerThread(QThread):
             self.error.emit(get_error("file_not_found", self.lang))
         except PermissionError:
             self.error.emit(get_error("file_permission", self.lang))
+        except subprocess.TimeoutExpired:
+            logging.error("Worker timed out", exc_info=True)
+            self.error.emit(get_error("operation_timeout", self.lang))
         except TypeError:
             self.error.emit(get_error("missing_argument", self.lang))
         except RuntimeError as exc:
@@ -469,6 +603,9 @@ class SmartSpoofWorker(QThread):
         except PermissionError:
             logging.error("Smart spoof worker: permission error", exc_info=True)
             self.error.emit(get_error("file_permission", self.lang))
+        except subprocess.TimeoutExpired:
+            logging.error("Smart spoof worker timed out", exc_info=True)
+            self.error.emit(get_error("operation_timeout", self.lang))
         except TypeError:
             logging.error("Smart spoof worker: missing argument", exc_info=True)
             self.error.emit(get_error("missing_argument", self.lang))
@@ -542,7 +679,13 @@ class BatchWorker(QThread):
                 args.append(f"-{safe}=")
             if len(args) > 2:
                 args.extend(["-overwrite_original", str(report.path)])
-                result = subprocess.run(args, capture_output=True, creationflags=get_subprocess_flags(), **EXIFTOOL_TEXT_KWARGS)
+                result = subprocess.run(
+                    args,
+                    capture_output=True,
+                    timeout=EXIFTOOL_TIMEOUT,
+                    creationflags=get_subprocess_flags(),
+                    **EXIFTOOL_TEXT_KWARGS,
+                )
                 stderr = (result.stderr or "").strip()
                 if result.returncode != 0 and not _is_exiftool_warnings_only(stderr):
                     raise RuntimeError(stderr or "Failed to clean residual fields.")
@@ -560,6 +703,12 @@ class BatchWorker(QThread):
             self.file_started.emit(index)
             self.file_progress.emit(index, 0)
             try:
+                if session.temp_dir is None:
+                    temp_dir = _create_tracked_temp_dir()
+                    work_path = temp_dir / f"{session.original_path.stem}_cleaned{session.original_path.suffix}"
+                    shutil.copy2(session.original_path, work_path)
+                    session.temp_dir = temp_dir
+                    session.work_path = work_path
                 report = analyzer.analyze(session.work_path)
                 if self.isInterruptionRequested():
                     logging.info("Batch processing interrupted after analyze index %s", index)
@@ -613,6 +762,7 @@ class BatchWorker(QThread):
                 )
                 self.file_risk_updated.emit(index, remaining_risk)
                 self.file_progress.emit(index, 100)
+                session.output_suffix = "cleaned" if self.mode == "remove" else "spoofed"
                 session.is_modified = True
 
                 _populate_session_keys(session)
@@ -866,6 +1016,8 @@ class MainWindow(QMainWindow):
             messages.append(tr(self.locale, _exiftool_banner_key()))
         if self.current_report is not None and self.current_report.file_type == "raw":
             messages.append(tr(self.locale, "raw_banner"))
+        if self.current_report is not None and self.current_report.file_type == "pdf":
+            messages.append(tr(self.locale, "pdf_banner"))
         self.banner.setText("\n".join(messages))
         self.banner.setVisible(bool(messages))
 
@@ -891,7 +1043,8 @@ class MainWindow(QMainWindow):
         if self.session is None:
             return False
         original_path = self.session.original_path
-        default_name = f"{original_path.stem}_cleaned{original_path.suffix}"
+        suffix = self.session.output_suffix or "cleaned"
+        default_name = f"{original_path.stem}_{suffix}{original_path.suffix}"
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             tr(self.locale, "save_dialog_title"),
@@ -1047,18 +1200,65 @@ class MainWindow(QMainWindow):
         worker = WorkerThread(lambda: analyzer.analyze(path), self.locale, self)
         self._start_worker(worker, on_success, loading_message=tr(self.locale, "loading"))
 
+    def _confirm_pdf_clean_options(self) -> tuple[bool, bool, bool]:
+        if self.current_report is None or self.current_report.file_type != "pdf":
+            return True, False, False
+        dialog = QDialog(self)
+        dialog.setWindowTitle(tr(self.locale, "pdf_clean_title"))
+        dialog.setMinimumWidth(420)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        body = QLabel(tr(self.locale, "pdf_clean_body"), dialog)
+        body.setWordWrap(True)
+        layout.addWidget(body)
+
+        annots_cb = QCheckBox(tr(self.locale, "pdf_strip_annotations"), dialog)
+        attach_cb = QCheckBox(tr(self.locale, "pdf_strip_attachments"), dialog)
+        layout.addWidget(annots_cb)
+        layout.addWidget(attach_cb)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton(tr(self.locale, "raw_warning_cancel"), dialog)
+        proceed_btn = QPushButton(tr(self.locale, "pdf_clean_proceed"), dialog)
+        cancel_btn.clicked.connect(dialog.reject)
+        proceed_btn.clicked.connect(dialog.accept)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(proceed_btn)
+        layout.addLayout(btn_row)
+
+        if dialog.exec() != QDialog.Accepted:
+            return False, False, False
+        return True, annots_cb.isChecked(), attach_cb.isChecked()
+
     def remove_all_metadata(self) -> None:
         if self.current_report is None:
             return
         if not self._confirm_raw_operation():
             return
+        proceed, strip_annotations, strip_attachments = self._confirm_pdf_clean_options()
+        if not proceed:
+            return
         removed_keys = {field.key for field in self.current_report.fields if not field.is_computed}
 
         def on_success(path: Path) -> None:
+            if self.session is not None:
+                self.session.output_suffix = "cleaned"
             self._refresh_after_operation(path, changed_keys=removed_keys, state="removed", toast_message=tr(self.locale, "field_removed"))
 
         output_path = self.session.work_path if self.session is not None else None
-        worker = WorkerThread(lambda: remove_all(self.current_report, output_path=output_path), self.locale, self)
+        worker = WorkerThread(
+            lambda: remove_all(
+                self.current_report,
+                output_path=output_path,
+                strip_annotations=strip_annotations,
+                strip_attachments=strip_attachments,
+            ),
+            self.locale,
+            self,
+        )
         self._start_worker(worker, on_success, loading_message=tr(self.locale, "loading"))
 
     def clean_residual_fields(self) -> None:
@@ -1163,7 +1363,13 @@ class MainWindow(QMainWindow):
 
             if tags_to_clear:
                 args = [exiftool, "-m"] + tags_to_clear + ["-overwrite_original", str(target)]
-                result = subprocess.run(args, capture_output=True, creationflags=get_subprocess_flags(), **EXIFTOOL_TEXT_KWARGS)
+                result = subprocess.run(
+                    args,
+                    capture_output=True,
+                    timeout=EXIFTOOL_TIMEOUT,
+                    creationflags=get_subprocess_flags(),
+                    **EXIFTOOL_TEXT_KWARGS,
+                )
                 stderr = (result.stderr or "").strip()
                 if result.returncode != 0 and not _is_exiftool_warnings_only(stderr):
                     raise RuntimeError(stderr or "Failed to remove residual fields.")
@@ -1358,6 +1564,7 @@ class MainWindow(QMainWindow):
             logging.debug("changed_keys passed to _record_session_changes: %s", changed_keys)
             logging.debug("session.spoofed_keys (full): %s", self.session.spoofed_keys)
         if self.session is not None and changes:
+            self.session.output_suffix = "spoofed"
             self.session.is_modified = True
             if "dates" in changes:
                 for f in new_report.fields:
@@ -1460,21 +1667,30 @@ class MainWindow(QMainWindow):
         self.report_screen.set_modified_state(self.session.is_modified)
 
     def _cleanup_session_files(self) -> None:
-        if self.session is not None and self.session.temp_dir is not None:
-            shutil.rmtree(self.session.temp_dir, ignore_errors=True)
+        if self.session is not None:
+            _remove_tracked_temp_dir(self.session.temp_dir)
         self.session = None
 
     def _cleanup_batch_sessions(self) -> None:
         for session in self.batch_sessions:
-            if session.temp_dir is not None:
-                shutil.rmtree(session.temp_dir, ignore_errors=True)
+            _remove_tracked_temp_dir(session.temp_dir)
         self.batch_sessions = []
 
     def _session_belongs_to_batch(self) -> bool:
         return self.session is not None and any(item.work_path == self.session.work_path for item in self.batch_sessions)
 
+    def _create_lazy_session(self, path: Path) -> FileSession:
+        empty_report = FileReport(path=path, file_type=path.suffix.lower().lstrip("."), fields=[], thumbnail=None)
+        return FileSession(
+            original_path=path,
+            work_path=path,
+            original_report=copy.deepcopy(empty_report),
+            current_report=empty_report,
+            temp_dir=None,
+        )
+
     def _create_temp_session(self, path: Path) -> FileSession:
-        temp_dir = Path(tempfile.mkdtemp(prefix="dms_"))
+        temp_dir = _create_tracked_temp_dir()
         work_path = temp_dir / f"{path.stem}_cleaned{path.suffix}"
         shutil.copy2(path, work_path)
         empty_report = FileReport(path=work_path, file_type=path.suffix.lower().lstrip("."), fields=[], thumbnail=None)
@@ -1583,7 +1799,7 @@ class MainWindow(QMainWindow):
         self.current_report = None
         self.field_states = {}
         self.selected_field_key = None
-        self.batch_sessions = [self._create_temp_session(path) for path in paths]
+        self.batch_sessions = [self._create_lazy_session(path) for path in paths]
         self.batch_screen.set_files([session.original_path for session in self.batch_sessions])
         self.stack.setCurrentWidget(self.batch_screen)
         self._update_topbar_context()
@@ -1596,7 +1812,7 @@ class MainWindow(QMainWindow):
         filtered = self._filter_dms_output_files(raw_paths)
         if filtered is None or not filtered:
             return
-        new_sessions = [self._create_temp_session(path) for path in filtered]
+        new_sessions = [self._create_lazy_session(path) for path in filtered]
         self.batch_sessions.extend(new_sessions)
         self.batch_screen.append_files([session.original_path for session in new_sessions])
         self._update_topbar_context()
@@ -1605,8 +1821,7 @@ class MainWindow(QMainWindow):
         if not (0 <= index < len(self.batch_sessions)):
             return
         session = self.batch_sessions.pop(index)
-        if session.temp_dir is not None:
-            shutil.rmtree(session.temp_dir, ignore_errors=True)
+        _remove_tracked_temp_dir(session.temp_dir)
         self.batch_screen.remove_index(index)
         self._update_topbar_context()
 
@@ -1656,8 +1871,22 @@ class MainWindow(QMainWindow):
         if not folder:
             return False
         output_dir = Path(folder)
-        for session in modified:
-            destination = output_dir / f"{session.original_path.stem}_cleaned{session.original_path.suffix}"
+        plan = _plan_batch_destinations(modified, output_dir)
+        existing = [dest for _, dest in plan if dest.exists()]
+        if existing:
+            preview = "\n".join(f"• {dest.name}" for dest in existing[:8])
+            if len(existing) > 8:
+                preview += f"\n• … (+{len(existing) - 8})"
+            reply = QMessageBox.question(
+                self,
+                tr(self.locale, "batch_overwrite_title"),
+                tr(self.locale, "batch_overwrite_body", n=len(existing), files=preview),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return False
+        for session, destination in plan:
             shutil.copy2(session.work_path, destination)
             session.is_modified = False
         self.batch_screen.set_all_done(True)
@@ -1746,17 +1975,27 @@ class MainWindow(QMainWindow):
             self.show_toast(tr(self.locale, "worker_session_busy"), "info")
             return
 
-        session = self._create_temp_session(path)
-        worker = WorkerThread(lambda: analyzer.analyze(session.work_path), self.locale, self)
+        def task() -> tuple[Path, Path, FileReport]:
+            temp_dir = _create_tracked_temp_dir()
+            work_path = temp_dir / f"{path.stem}_cleaned{path.suffix}"
+            try:
+                shutil.copy2(path, work_path)
+                report = analyzer.analyze(work_path)
+                return temp_dir, work_path, report
+            except Exception:
+                _remove_tracked_temp_dir(temp_dir)
+                raise
+
+        worker = WorkerThread(task, self.locale, self)
         self._arm_session_worker(worker)
         self.report_screen.set_busy(True, tr(self.locale, "loading"))
         self.report_screen.set_status_message(tr(self.locale, "loading"))
-        worker.result.connect(lambda report, current=session, current_worker=worker: self._on_report_ready(current.original_path, current.work_path, current.temp_dir, report))
-        worker.error.connect(lambda message, tmp=session.temp_dir, current=worker: self._handle_load_error(message, tmp, current))
+        worker.result.connect(lambda payload, orig=path: self._on_report_ready(orig, payload[1], payload[0], payload[2]))
+        worker.error.connect(lambda message, current=worker: self._handle_worker_error(message, current))
         worker.start()
 
-    def _handle_load_error(self, message: str, temp_dir: Path, worker: QThread) -> None:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    def _handle_load_error(self, message: str, temp_dir: Path | None, worker: QThread) -> None:
+        _remove_tracked_temp_dir(temp_dir)
         self._handle_worker_error(message, worker)
 
     def _on_report_ready(self, original_path: Path, work_path: Path, temp_dir: Path, report: FileReport) -> None:
@@ -1775,10 +2014,14 @@ class MainWindow(QMainWindow):
         if not self._guard_navigation_loss():
             event.ignore()
             return
-        for worker in list(self._workers):
+        workers = list(self._workers)
+        for worker in workers:
+            worker.blockSignals(True)
             worker.requestInterruption()
-        for worker in list(self._workers):
-            if not worker.wait(_CLOSE_JOIN_TIMEOUT_MS):
+        deadline = time.monotonic() + (_CLOSE_JOIN_TIMEOUT_MS / 1000.0)
+        for worker in workers:
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            if not worker.wait(remaining_ms):
                 logging.warning(
                     "QThread did not finish within %s ms after interruption: %s",
                     _CLOSE_JOIN_TIMEOUT_MS,
@@ -1829,6 +2072,7 @@ def main() -> None:
     os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
 
     configure_logging()
+    cleanup_stale_temp_dirs()
     app = QApplication.instance() or QApplication(sys.argv)
     # Stable style across Windows versions; avoids odd window-decoration behavior with some themes.
     app.setStyle("Fusion")

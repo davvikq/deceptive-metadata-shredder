@@ -285,9 +285,30 @@ QUICKTIME_TECH_TAGS = {
     "ChannelCount",
     "LayoutFlags",
     "LanguageCode",
+    "MovieTimeScale",
+    "TrackTimeScale",
+    "SampleTime",
 }
 
-TECHNICAL_TAGS = ICC_TAGS | FILE_TECH_TAGS | CAMERA_TECH_TAGS | QUICKTIME_TECH_TAGS
+GEOTIFF_TECH_TAGS = {
+    "ModelTiePoint",
+    "ModelTiePointTag",
+    "ModelPixelScale",
+    "ModelPixelScaleTag",
+    "ModelTransformation",
+    "ModelTransformationTag",
+    "GeoKeyDirectory",
+    "GeoDoubleParams",
+    "GeoAsciiParams",
+    "GeoTiffVersion",
+    "GTModelType",
+    "GTRasterType",
+    "GeographicType",
+    "ProjectedCSType",
+    "IntergraphMatrix",
+}
+
+TECHNICAL_TAGS = ICC_TAGS | FILE_TECH_TAGS | CAMERA_TECH_TAGS | QUICKTIME_TECH_TAGS | GEOTIFF_TECH_TAGS
 
 SENSITIVE_KEYWORDS = [
     "GPS",
@@ -327,6 +348,7 @@ SENSITIVE_EXACT_TAGS = {
     "Creator",
     "Artist",
     "Owner",
+    "Producer",
     "Make",
     "Model",
     "SerialNumber",

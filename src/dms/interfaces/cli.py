@@ -175,6 +175,9 @@ def handle_exception(exc: Exception) -> None:
     if isinstance(exc, OutputPathError):
         print_error(str(exc))
         raise typer.Exit(1)
+    if isinstance(exc, (typer.BadParameter, ValueError)):
+        print_error(str(exc))
+        raise typer.Exit(2)
     if isinstance(exc, RuntimeError):
         message = classify_exiftool_error(str(exc), "en")
         if "exiftool" in str(exc).lower():
@@ -406,6 +409,7 @@ def _command_summary() -> Table:
     table.add_row("dms verify <file>", "Check whether a file still holds sensitive metadata")
     table.add_row("dms clean <file>", "Write a copy with metadata stripped (*_cleaned by default)")
     table.add_row("dms spoof <file>", "Replace GPS/device/dates/author with plausible values")
+    table.add_row("dms devices", "List available device IDs for --device")
     table.add_row("dms watch <folder>", "React to new files in a folder (optional dms_cleaned/ output)")
     table.add_row("dms batch <paths…>", "Clean or spoof many files at once (--output-dir optional)")
     return table
@@ -422,8 +426,16 @@ def _parse_gps_argument(value: str) -> tuple[str, tuple[float, float] | None]:
     if lowered in {"smart", "remove"}:
         return lowered, None
     if "," in value:
-        lat_text, lon_text = [part.strip() for part in value.split(",", 1)]
-        return "manual", (float(lat_text), float(lon_text))
+        parts = [part.strip() for part in value.split(",")]
+        if len(parts) != 2:
+            raise typer.BadParameter("Invalid GPS coordinates. Use smart, remove, or lat,lon.")
+        try:
+            lat, lon = float(parts[0]), float(parts[1])
+        except ValueError as exc:
+            raise typer.BadParameter("Invalid GPS coordinates. Latitude and longitude must be numbers.") from exc
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise typer.BadParameter("GPS coordinates out of range (lat: -90..90, lon: -180..180).")
+        return "manual", (lat, lon)
     raise typer.BadParameter("Use smart, remove, or lat,lon.")
 
 
@@ -432,7 +444,10 @@ def _parse_dates_argument(value: str) -> tuple[str, int]:
     if lowered in {"random", "remove", "keep"}:
         return lowered, 0
     if lowered.startswith("shift:"):
-        return "shift", int(lowered.split(":", 1)[1])
+        try:
+            return "shift", int(lowered.split(":", 1)[1])
+        except ValueError as exc:
+            raise typer.BadParameter("Invalid shift offset. Use shift:<days> with an integer.") from exc
     raise typer.BadParameter("Use random, remove, keep, or shift:<days>.")
 
 
@@ -448,7 +463,7 @@ def _resolve_device_option(option: str) -> tuple[str | None, str | None]:
         match = next((item for item in get_models_by_make(make) if item.id == option), None)
         if match:
             return match.make, match.model
-    raise typer.BadParameter(f"Unknown device id: {option}")
+    raise typer.BadParameter(f"Unknown device id: {option}. Run 'dms devices' to list available IDs.")
 
 
 def _default_spoof_output(path: Path, output: Path | None) -> Path:
@@ -753,6 +768,16 @@ def clean(
     file: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source file."),
     output: Path | None = typer.Option(None, "--output", "-o", help="Destination path; default is sibling *_cleaned."),
     yes: bool = typer.Option(False, "--yes", help="Skip confirmation prompt."),
+    strip_annotations: bool = typer.Option(
+        False,
+        "--strip-annotations",
+        help="Also remove PDF annotations and comments (text, popups).",
+    ),
+    strip_attachments: bool = typer.Option(
+        False,
+        "--strip-attachments",
+        help="Also remove PDF embedded file attachments.",
+    ),
 ) -> None:
     """Remove all metadata into a new file (original is left unchanged)."""
 
@@ -763,6 +788,9 @@ def clean(
         sensitive = _risk_count(report)
         if report.analysis_status != "ok":
             console.print(f"[bold yellow]! Warning:[/bold yellow] {report.analysis_error or 'metadata could not be read completely.'}")
+        if report.file_type == "pdf":
+            for warning in report.warnings:
+                console.print(f"[yellow]! {warning}[/yellow]")
         target = build_output_path(file, output)
         _ensure_output_differs(file, target)
         _confirm_overwrite(target, yes=yes)
@@ -779,7 +807,12 @@ def clean(
             console=console,
         ) as progress:
             task = progress.add_task("Removing metadata...", total=100)
-            result = remove_all(file, target)
+            result = remove_all(
+                file,
+                target,
+                strip_annotations=strip_annotations,
+                strip_attachments=strip_attachments,
+            )
             progress.update(task, completed=100)
 
         console.print(f"[bold green]✓ Cleaned:[/bold green] {result.name}")
@@ -799,7 +832,7 @@ def spoof(
     output: Path | None = typer.Option(None, "--output", "-o", help="Destination path; default is sibling *_spoofed."),
     yes: bool = typer.Option(False, "--yes", help="Skip confirmation prompt."),
     gps: str = typer.Option("smart", "--gps", help="smart, remove, or lat,lon."),
-    device: str | None = typer.Option(None, "--device", help="Device id from bundled DB, or omit for smart."),
+    device: str | None = typer.Option(None, "--device", help="Device id from bundled DB (see 'dms devices'), random, vintage, or omit for smart."),
     author: str | None = typer.Option(None, "--author", help="Author string or 'remove'."),
     dates: str = typer.Option("random", "--dates", help="random, remove, keep, or shift:<days>."),
     residual: bool = typer.Option(False, "--residual", help="Remove remaining sensitive fields after spoofing."),
@@ -904,6 +937,56 @@ def spoof(
             _print_info_codes(info_codes)
         console.print(f"[dim white]Saved to:[/dim white] {final_path}")
         console.print(f"Risk reduced: [bold red]{original_risk}[/bold red] → [bold green]{final_risk}[/bold green] fields")
+    except (typer.Exit, typer.Abort):
+        raise
+    except Exception as exc:
+        handle_exception(exc)
+
+
+@app.command()
+def devices(
+    make: str | None = typer.Option(None, "--make", help="Filter devices by manufacturer."),
+    format: str = typer.Option("table", "--format", help="Output: table (default) or json."),
+) -> None:
+    """List available device IDs for --device."""
+
+    try:
+        items = get_all_devices()
+        if make:
+            lowered_make = make.strip().lower()
+            items = [item for item in items if item.make.lower() == lowered_make]
+        if format.lower() == "json":
+            payload = [
+                {
+                    "id": item.id,
+                    "make": item.make,
+                    "model": item.model,
+                    "year": item.year,
+                    "software": item.software,
+                }
+                for item in items
+            ]
+            console.print(
+                json.dumps(payload, ensure_ascii=False),
+                soft_wrap=True,
+                markup=False,
+                highlight=False,
+            )
+            return
+        print_banner()
+        table = Table(box=box.ROUNDED, header_style="bold bright_white")
+        table.add_column("ID", style="bright_cyan", overflow="fold")
+        table.add_column("Make", style="white")
+        table.add_column("Model", style="white")
+        table.add_column("Year", justify="right", style="dim white")
+        table.add_column("Software", style="dim white", overflow="fold")
+        for item in items:
+            table.add_row(item.id, item.make, item.model, str(item.year), item.software or "—")
+        console.print(table)
+        console.print(
+            f"[dim white]{len(items)} device(s) available. Use with:[/dim white] "
+            "[bold bright_cyan]dms spoof <file> --device <ID>[/bold bright_cyan]"
+        )
     except (typer.Exit, typer.Abort):
         raise
     except Exception as exc:

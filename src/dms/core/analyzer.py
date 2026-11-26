@@ -59,6 +59,10 @@ RAW_READONLY_TAGS = {"InternalSerialNumber"}
 IMAGE_PARSE_WARNING = "Image metadata could not be fully parsed. Showing limited report."
 IMAGE_THUMBNAIL_WARNING = "Could not render image preview thumbnail."
 ANALYSIS_LIMITED_WARNING = "Metadata analysis is limited; verification cannot guarantee this file is clean."
+PDF_LIMITATION_WARNING = (
+    "Standard PDF cleaning strips document info and annotation authors, "
+    "but preserves annotation text, form values, attachments, and embedded image metadata."
+)
 ZERO_DATE_PREFIXES = ("0000:00:00", "0000-00-00")
 
 
@@ -179,7 +183,7 @@ def _run_exiftool_json(path: Path) -> dict[str, Any]:
 def _run_exiftool_pdf_json(path: Path) -> dict[str, Any]:
     exiftool = find_exiftool()
     result = subprocess.run(
-        [exiftool, "-json", "-pdf:all", "-xmp:all", "-charset", "filename=UTF8", str(path)],
+        [exiftool, "-json", "-G1", "-pdf:all", "-xmp:all", "-charset", "filename=UTF8", str(path)],
         check=True,
         capture_output=True,
         timeout=EXIFTOOL_TIMEOUT,
@@ -452,10 +456,11 @@ def _rational_to_degrees(rational: Any) -> float | None:
     return round(degrees + minutes / 60 + seconds / 3600, 6)
 
 
-def _analyze_pdf(path: Path) -> tuple[list[MetaField], str, str | None]:
+def _analyze_pdf(path: Path) -> tuple[list[MetaField], str, str | None, list[str]]:
     fields: list[MetaField] = []
     status = "ok"
     error: str | None = None
+    pdf_warnings: list[str] = [PDF_LIMITATION_WARNING]
     if get_exiftool_path():
         seen_tags: set[str] = set()
         seen_keys: set[str] = set()
@@ -488,10 +493,26 @@ def _analyze_pdf(path: Path) -> tuple[list[MetaField], str, str | None]:
             "ModDate": metadata.get("/ModDate"),
             "PDFVersion": version,
         }
+        annot_count = sum(len(page.get("/Annots") or []) for page in reader.pages)
+        attach_count = len(reader.attachments)
+        root = reader.trailer.get("/Root")
+        has_form = bool(root and "/AcroForm" in root.get_object())
+        details: list[str] = []
+        if annot_count:
+            details.append(f"{annot_count} annotation(s)")
+        if attach_count:
+            details.append(f"{attach_count} attachment(s)")
+        if has_form:
+            details.append("interactive form fields")
+        if details:
+            pdf_warnings.append(
+                f"PDF contains {', '.join(details)}. "
+                "Use --strip-annotations / --strip-attachments to remove annotations or attachments."
+            )
     for key, value in pdf_extras.items():
         if not any(field.key == key for field in fields):
             _safe_append(fields, key, value)
-    return fields, status, error
+    return fields, status, error, pdf_warnings
 
 
 def _analyze_docx(path: Path) -> tuple[list[MetaField], str, str | None]:
@@ -703,7 +724,9 @@ def analyze(path: Path) -> FileReport:
 
     if suffix in PDF_SUFFIXES:
         try:
-            fields, status, error = _analyze_pdf(file_path)
+            fields, status, error, pdf_warnings = _analyze_pdf(file_path)
+            for msg in pdf_warnings:
+                _append_warning_once(warnings, msg)
         except Exception as exc:
             logging.exception("Failed to analyze PDF: %s", file_path)
             fields, status, error = [], "unverified", f"Metadata could not be read: {exc}"

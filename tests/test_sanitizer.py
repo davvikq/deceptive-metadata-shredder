@@ -202,3 +202,83 @@ def test_clean_tiny_webp_is_not_rejected_as_truncated(tmp_path) -> None:
     assert cleaned.stat().st_size > 0
     assert analyze(cleaned).by_key().get("Make") is None
     assert analyze(cleaned).analysis_status == "ok"
+
+
+def test_pdf_strip_annotations_and_attachments_removes_content(tmp_path) -> None:
+    source = tmp_path / "legal.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_attachment(filename="secret.txt", data=b"attachment-secret")
+    annotation = Text(rect=(20, 20, 40, 40), text="PII_IN_ANNOTATION")
+    annotation[NameObject("/T")] = TextStringObject("Lawyer Name")
+    writer.add_annotation(page_number=0, annotation=annotation)
+    writer.add_metadata({"/Author": "Lawyer Name"})
+    writer.write(source)
+
+    stripped = remove_all(
+        source,
+        tmp_path / "legal_stripped.pdf",
+        strip_annotations=True,
+        strip_attachments=True,
+    )
+    reader = PdfReader(stripped)
+    raw_bytes = stripped.read_bytes()
+
+    assert b"PII_IN_ANNOTATION" not in raw_bytes
+    assert b"attachment-secret" not in raw_bytes
+    assert b"Lawyer Name" not in raw_bytes
+    assert reader.pages[0].get("/Annots") is None
+    assert reader.attachments == {}
+
+
+def test_docx_clean_uses_plausible_staggered_zip_dates(tmp_path) -> None:
+    cleaned = remove_all(FIXTURES / "test_document.docx", tmp_path / "doc_cleaned.docx")
+
+    with zipfile.ZipFile(cleaned) as archive:
+        timestamps = [info.date_time for info in archive.infolist()]
+
+    assert timestamps
+    assert not all(ts == (1980, 1, 1, 0, 0, 0) for ts in timestamps)
+    assert all(ts[0] >= 2000 for ts in timestamps)
+    assert len(set(timestamps)) > 1
+
+
+def test_pillow_jpeg_fallback_preserves_orientation_icc_and_quality(tmp_path, monkeypatch) -> None:
+    import piexif
+    from PIL import Image
+    from dms.core import sanitizer
+
+    source = tmp_path / "rotated.jpg"
+    img = Image.new("RGB", (40, 20), color=(120, 180, 60))
+    icc = b"dummy-icc-profile-bytes"
+    exif_bytes = piexif.dump({"0th": {piexif.ImageIFD.Orientation: 6, piexif.ImageIFD.Make: b"Canon"}})
+    img.save(source, format="JPEG", quality=95, exif=exif_bytes, icc_profile=icc)
+
+    monkeypatch.setattr(sanitizer.piexif, "remove", lambda _p: (_ for _ in ()).throw(RuntimeError("piexif broken")))
+    sanitizer._sanitize_image_without_exiftool(source)
+
+    with Image.open(source) as result:
+        assert result.size == (20, 40)
+        assert result.info.get("icc_profile") == icc
+        assert not result.getexif()
+
+
+def test_pillow_png_fallback_strips_text_chunks_and_keeps_icc(tmp_path) -> None:
+    from PIL import Image, PngImagePlugin
+    from dms.core import sanitizer
+
+    source = tmp_path / "secret.png"
+    img = Image.new("RGB", (24, 24), color=(10, 20, 30))
+    icc = b"dummy-png-icc"
+    pnginfo = PngImagePlugin.PngInfo()
+    pnginfo.add_text("Author", "Secret Author")
+    pnginfo.add_text("Comment", "Secret Comment")
+    img.save(source, format="PNG", pnginfo=pnginfo, icc_profile=icc)
+
+    sanitizer._sanitize_image_without_exiftool(source)
+
+    with Image.open(source) as result:
+        assert "Author" not in result.info
+        assert "Comment" not in result.info
+        assert result.info.get("icc_profile") == icc
+    assert b"Secret Author" not in source.read_bytes()

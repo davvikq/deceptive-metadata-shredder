@@ -980,3 +980,63 @@ def test_apply_spoof_writes_to_explicit_output_path(tmp_path, monkeypatch) -> No
 
     assert result == target
     assert target.exists()
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_docx_spoof_clears_python_docx_signature_and_staggers_zip_dates(tmp_path) -> None:
+    import zipfile
+    from docx import Document
+
+    source = tmp_path / "doc.docx"
+    source.write_bytes((FIXTURES / "test_document.docx").read_bytes())
+
+    result, _, _ = apply_smart_spoof(analyze(source))
+
+    doc = Document(str(result))
+    assert "python-docx" not in (doc.core_properties.comments or "").lower()
+    with zipfile.ZipFile(result) as archive:
+        timestamps = [info.date_time for info in archive.infolist()]
+    assert not all(ts == (1980, 1, 1, 0, 0, 0) for ts in timestamps)
+    assert len(set(timestamps)) > 1
+
+
+def test_spoof_does_not_add_xmp_when_source_lacks_xmp() -> None:
+    from dms.core.models import Device
+
+    no_xmp_mp4 = FileReport(
+        path=Path("clip.mp4"),
+        file_type="mp4",
+        fields=[MetaField("QuickTime:CreateDate", "CreateDate", "Create Date", "2024:01:01 00:00:00", "dates", True, True)],
+    )
+    mp4_tags = spoofer_module._get_date_write_tags("mp4", no_xmp_mp4)
+    assert mp4_tags == ["QuickTime:CreateDate", "QuickTime:ModifyDate"]
+
+    no_xmp_pdf = FileReport(
+        path=Path("doc.pdf"),
+        file_type="pdf",
+        fields=[MetaField("PDF:CreateDate", "CreateDate", "Create Date", "2024:01:01 00:00:00", "dates", True, True)],
+    )
+    pdf_tags = spoofer_module._get_date_write_tags("pdf", no_xmp_pdf)
+    assert pdf_tags == ["PDF:CreateDate", "PDF:ModifyDate"]
+
+    device = Device(id="cam1", make="Nikon", model="D850", software="Ver.1.00", year=2017)
+    no_creatortool_report = FileReport(
+        path=Path("photo.jpg"),
+        file_type="jpeg",
+        fields=[MetaField("EXIF:Make", "Make", "Make", "Canon", "device", True, True)],
+    )
+    updates = spoofer_module._build_full_device_tags(device, no_creatortool_report)
+    assert "CreatorTool" not in updates
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_pdf_smart_spoof_spoofs_producer_and_skips_new_xmp(tmp_path) -> None:
+    source = tmp_path / "doc.pdf"
+    source.write_bytes((FIXTURES / "test_document.pdf").read_bytes())
+
+    result, _, _ = apply_smart_spoof(analyze(source))
+    reloaded = analyze(result)
+    fields = reloaded.by_key()
+
+    assert fields["Producer"].value != "pypdf"
+    assert not any(field.exiftool_tag.upper().startswith("XMP") for field in reloaded.fields)

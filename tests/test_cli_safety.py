@@ -154,3 +154,59 @@ def test_residual_cleanup_removes_all_group_variants(tmp_path) -> None:
         if field.key == "Software"
     }
     assert software == set()
+
+
+def test_spoof_invalid_device_and_gps_show_diagnostic_errors(tmp_path) -> None:
+    source = _copy_fixture(tmp_path)
+
+    bad_device = runner.invoke(
+        cli.app,
+        ["spoof", str(source), "--device", "nonexistent_device", "--yes"],
+    )
+    assert bad_device.exit_code != 0
+    assert "Unknown device id: nonexistent_device" in bad_device.output
+    assert "dms devices" in bad_device.output
+    assert "Something went wrong" not in bad_device.output
+
+    bad_gps = runner.invoke(
+        cli.app,
+        ["spoof", str(source), "--gps", "1,2,3", "--yes"],
+    )
+    assert bad_gps.exit_code != 0
+    assert "Invalid GPS coordinates" in bad_gps.output
+    assert "Something went wrong" not in bad_gps.output
+
+
+def test_cli_devices_lists_device_ids() -> None:
+    table_result = runner.invoke(cli.app, ["devices"])
+    assert table_result.exit_code == 0
+    assert "device(s) available" in table_result.output
+
+    json_result = runner.invoke(cli.app, ["devices", "--format", "json"])
+    assert json_result.exit_code == 0
+    devices_payload = json.loads(json_result.output)
+    assert isinstance(devices_payload, list)
+    assert len(devices_payload) > 0
+    assert {"id", "make", "model"}.issubset(devices_payload[0])
+
+
+def test_cli_clean_pdf_strip_flags(tmp_path) -> None:
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.annotations import Text
+
+    source = tmp_path / "doc.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_annotation(page_number=0, annotation=Text(rect=(10, 10, 30, 30), text="PII_IN_ANNOTATION"))
+    writer.add_attachment(filename="secret.txt", data=b"attachment-secret")
+    writer.write(source)
+
+    result = runner.invoke(
+        cli.app,
+        ["clean", str(source), "--strip-annotations", "--strip-attachments", "--yes"],
+    )
+
+    assert result.exit_code == 0
+    cleaned = source.with_name(f"{source.stem}_cleaned{source.suffix}")
+    assert b"PII_IN_ANNOTATION" not in cleaned.read_bytes()
+    assert PdfReader(cleaned).attachments == {}

@@ -154,3 +154,42 @@ def test_same_tag_name_in_different_groups_is_not_deduplicated(tmp_path) -> None
     software_tags = {field.exiftool_tag for field in report.fields if field.key == "Software"}
 
     assert {"IFD0:Software", "XMP-tiff:Software"} <= software_tags
+
+
+def test_producer_is_sensitive() -> None:
+    fields: list[analyzer.MetaField] = []
+    _safe_append(fields, "PDF:Producer", "pypdf")
+
+    assert len(fields) == 1
+    assert fields[0].is_sensitive is True
+    assert fields[0].status == "risk"
+
+
+def test_geotiff_and_quicktime_time_tags_are_not_sensitive() -> None:
+    fields: list[analyzer.MetaField] = []
+    _safe_append(fields, "EXIF:ModelTiePoint", "0 0 0 10 20 0")
+    _safe_append(fields, "EXIF:ModelPixelScale", "1 1 0")
+    _safe_append(fields, "EXIF:GeoKeyDirectory", "1 1 0 1")
+    _safe_append(fields, "QuickTime:MovieTimeScale", 600)
+    _safe_append(fields, "QuickTime:TrackTimeScale", 600)
+    _safe_append(fields, "QuickTime:SampleTime", "0 s")
+
+    assert [field.is_sensitive for field in fields] == [False] * 6
+    assert all(field.status == "clean" for field in fields)
+
+
+def test_pdf_analysis_warns_about_annotations_and_attachments(tmp_path) -> None:
+    from pypdf import PdfWriter
+    from pypdf.annotations import Text
+
+    source = tmp_path / "annotated.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_annotation(page_number=0, annotation=Text(rect=(10, 10, 30, 30), text="PII_IN_ANNOTATION"))
+    writer.add_attachment(filename="secret.txt", data=b"secret")
+    writer.write(source)
+
+    report = analyze(source)
+
+    assert analyzer.PDF_LIMITATION_WARNING in report.warnings
+    assert any("1 annotation(s)" in w and "1 attachment(s)" in w for w in report.warnings)
