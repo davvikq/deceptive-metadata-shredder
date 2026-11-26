@@ -13,6 +13,7 @@ from docx import Document
 
 from dms.config import get_exiftool_path, require_exiftool
 from dms.core import geo_validator
+from dms.core.analyzer import FILESYSTEM_DATE_KEYS
 from dms.core.constants import (
     ALWAYS_DELETE_PREFIXES,
     ALWAYS_DELETE_TAGS,
@@ -839,7 +840,9 @@ def apply_smart_spoof(
 
     def work(destination: Path) -> None:
         has_dates = any(
-            ("date" in field.key.lower() or "time" in field.key.lower()) and field.is_sensitive
+            ("date" in field.key.lower() or "time" in field.key.lower())
+            and field.is_sensitive
+            and field.key not in FILESYSTEM_DATE_KEYS
             for field in file_report.fields
         )
         dates_anchor: datetime | None = None

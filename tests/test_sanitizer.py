@@ -282,3 +282,42 @@ def test_pillow_png_fallback_strips_text_chunks_and_keeps_icc(tmp_path) -> None:
         assert "Comment" not in result.info
         assert result.info.get("icc_profile") == icc
     assert b"Secret Author" not in source.read_bytes()
+
+
+def test_clean_mp4_zeros_quicktime_dates_and_passes_verify(tmp_path) -> None:
+    import struct
+    from dms.config import get_exiftool_path
+    from dms.core.analyzer import verify
+
+    if not get_exiftool_path():
+        pytest.skip("exiftool is required for MP4 sanitization test")
+
+    def box(tag: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I4s", 8 + len(payload), tag) + payload
+
+    ftyp = box(b"ftyp", b"isom" + struct.pack(">I", 0x200) + b"isomiso2mp41")
+    ctime = 3786825600
+    mvhd_data = struct.pack(
+        ">IIIIIIH10s36s24sI",
+        0,
+        ctime,
+        ctime,
+        1000,
+        5000,
+        0x00010000,
+        0x0100,
+        b"\x00" * 10,
+        b"\x00" * 36,
+        b"\x00" * 24,
+        1,
+    )
+    moov = box(b"moov", box(b"mvhd", mvhd_data))
+    mdat = box(b"mdat", b"\x00" * 100)
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(ftyp + moov + mdat)
+    assert verify(source)
+
+    cleaned = remove_all(source, tmp_path / "clip_cleaned.mp4")
+
+    assert verify(cleaned) == []

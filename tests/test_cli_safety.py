@@ -210,3 +210,99 @@ def test_cli_clean_pdf_strip_flags(tmp_path) -> None:
     cleaned = source.with_name(f"{source.stem}_cleaned{source.suffix}")
     assert b"PII_IN_ANNOTATION" not in cleaned.read_bytes()
     assert PdfReader(cleaned).attachments == {}
+
+
+def test_clean_does_not_print_cleaned_when_verification_fails(tmp_path, monkeypatch) -> None:
+    source = _copy_fixture(tmp_path)
+    residual = MetaField(
+        exiftool_tag="QuickTime:CreateDate",
+        key="CreateDate",
+        label="Create Date",
+        value="2024:01:01 00:00:00",
+        category="dates",
+        spoofable=True,
+        is_sensitive=True,
+    )
+    monkeypatch.setattr(cli.analyzer, "verify", lambda _path: [residual])
+
+    result = runner.invoke(cli.app, ["clean", str(source), "--yes"])
+
+    assert result.exit_code == 1
+    assert "✓ Cleaned:" not in result.output
+    assert "Verification:" in result.output
+
+
+def test_report_diff_does_not_mask_unmodified_group_variant() -> None:
+    from dms.core.models import FileReport
+
+    before = FileReport(
+        path=Path("photo.jpg"),
+        file_type="jpeg",
+        fields=[
+            MetaField("IFD0:Software", "Software", "Software", "OldApp", "device", True, True),
+            MetaField("XMP-tiff:Software", "Software", "Software", "OldApp", "device", True, True),
+        ],
+    )
+    after = FileReport(
+        path=Path("photo_spoofed.jpg"),
+        file_type="jpeg",
+        fields=[
+            MetaField("IFD0:Software", "Software", "Software", "NewApp", "device", True, True),
+            MetaField("XMP-tiff:Software", "Software", "Software", "OldApp", "device", True, True),
+        ],
+    )
+
+    changed, removed = cli._report_diff(before, after)
+    cli._apply_cli_statuses(after, spoofed_keys=changed, removed_keys=removed)
+
+    assert changed == {"IFD0:Software"}
+    assert after.fields[0].status == "spoofed"
+    assert after.fields[1].status == "risk"
+    assert cli._risk_count(after) == 1
+    assert [f.exiftool_tag for f in cli._residual_fields(after, changed)] == ["XMP-tiff:Software"]
+
+
+def test_preview_spoof_plan_matches_actual_spoofer_conditions() -> None:
+    from dms.core.models import FileReport, SpoofProfile
+
+    report = FileReport(
+        path=Path("doc.pdf"),
+        file_type="pdf",
+        fields=[
+            MetaField("PDF:Producer", "Producer", "Producer", "pypdf", "author", True, True),
+            MetaField("System:FileModifyDate", "FileModifyDate", "File Modified", "2024:01:01 00:00:00", "dates", True, True),
+            MetaField("EXIF:Make", "Make", "Device Make", "Apple", "device", True, True),
+        ],
+    )
+
+    _, changes = cli._preview_spoof_plan(report, SpoofProfile(), smart=True)
+
+    assert "author" not in changes
+    assert "dates" not in changes
+    assert "device" in changes
+
+
+def test_cli_spoof_author_remove_clears_author_tags(tmp_path) -> None:
+    import subprocess
+    from dms.config import get_exiftool_path
+
+    exiftool = get_exiftool_path()
+    if not exiftool:
+        return
+    source = _copy_fixture(tmp_path)
+    subprocess.run(
+        [exiftool, "-overwrite_original", "-EXIF:Artist=Alice", "-XMP-dc:Creator=Alice", str(source)],
+        check=True,
+        capture_output=True,
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["spoof", str(source), "--gps", "remove", "--dates", "keep", "--author", "REMOVE", "--yes"],
+    )
+
+    assert result.exit_code == 0
+    assert "Note:" in result.output
+    fields = analyze(source.with_name(f"{source.stem}_spoofed{source.suffix}")).by_key()
+    assert "Artist" not in fields
+    assert "Creator" not in fields

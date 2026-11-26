@@ -170,8 +170,23 @@ def _clear_residual_sensitive_tags(destination: Path, exiftool: str) -> None:
 
 def _sanitize_with_exiftool(destination: Path) -> None:
     exiftool = require_exiftool()
+    args = [exiftool, "-overwrite_original_in_place", "-all="]
+    if destination.suffix.lower() in {".mp4", ".mov"}:
+        # QuickTime mvhd/tkhd/mdhd timestamps cannot be deleted with -all=; zero them.
+        args.extend(
+            [
+                "-m",
+                "-QuickTime:CreateDate=0000:00:00 00:00:00",
+                "-QuickTime:ModifyDate=0000:00:00 00:00:00",
+                "-QuickTime:TrackCreateDate=0000:00:00 00:00:00",
+                "-QuickTime:TrackModifyDate=0000:00:00 00:00:00",
+                "-QuickTime:MediaCreateDate=0000:00:00 00:00:00",
+                "-QuickTime:MediaModifyDate=0000:00:00 00:00:00",
+            ]
+        )
+    args.append(str(destination))
     result = subprocess.run(
-        [exiftool, "-overwrite_original_in_place", "-all=", str(destination)],
+        args,
         check=False,
         capture_output=True,
         timeout=EXIFTOOL_TIMEOUT,

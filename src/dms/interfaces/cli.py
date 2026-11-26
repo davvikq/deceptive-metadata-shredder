@@ -32,7 +32,7 @@ from dms.core.error_messages import classify_exiftool_error, get_error
 from dms.core.exiftool_tags import validate_exif_tag
 from dms.core.models import FileReport, MetaField, SpoofProfile
 from dms.core.sanitizer import OutputPathError, build_output_path, remove_all
-from dms.core.spoofer import apply_smart_spoof, apply_spoof
+from dms.core.spoofer import _existing_author_fields, _find_gps_field, apply_smart_spoof, apply_spoof
 from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags
 from dms.interfaces.watcher import DMSEventHandler
 
@@ -253,45 +253,59 @@ def _field_aliases(field: MetaField) -> set[str]:
     return {item for item in aliases if item}
 
 
+def _matches_field_keys(field: MetaField, keys: set[str]) -> bool:
+    if not keys:
+        return False
+    qualified = {_canonical_key(key) for key in keys if ":" in key}
+    unqualified = {_canonical_key(key) for key in keys if ":" not in key}
+    if qualified and _canonical_key(field.exiftool_tag) in qualified:
+        return True
+    if unqualified and (_field_aliases(field) & unqualified):
+        return True
+    return False
+
+
 def _apply_cli_statuses(report: FileReport, spoofed_keys: set[str] | None = None, removed_keys: set[str] | None = None) -> None:
-    spoofed = {_canonical_key(key) for key in (spoofed_keys or set())}
-    removed = {_canonical_key(key) for key in (removed_keys or set())}
+    spoofed = set(spoofed_keys or set())
+    removed = set(removed_keys or set())
     for field in report.fields:
-        aliases = _field_aliases(field)
-        if aliases & removed:
+        if _matches_field_keys(field, removed):
             field.status = "removed"
-        elif aliases & spoofed:
+        elif _matches_field_keys(field, spoofed):
             field.status = "spoofed"
         else:
             field.status = "risk" if field.is_sensitive else "clean"
 
 
 def _report_diff(before: FileReport, after: FileReport) -> tuple[set[str], set[str]]:
-    """Return field keys that actually changed and keys that disappeared."""
+    """Return field tags that actually changed and tags that disappeared."""
 
     after_values: dict[str, set[str]] = {}
     for field in after.fields:
-        after_values.setdefault(field.key, set()).add(str(field.value))
-    before_keys = {field.key for field in before.fields}
+        tag_id = (field.exiftool_tag or field.key).lower()
+        after_values.setdefault(tag_id, set()).add(str(field.value))
+    before_tags = {(field.exiftool_tag or field.key).lower() for field in before.fields}
 
     changed: set[str] = set()
     removed: set[str] = set()
     for field in before.fields:
         if field.is_computed or not field.is_sensitive or field.key in analyzer.FILESYSTEM_DATE_KEYS:
             continue
-        values = after_values.get(field.key)
+        tag = field.exiftool_tag or field.key
+        values = after_values.get(tag.lower())
         if values is None:
-            removed.add(field.key)
+            removed.add(tag)
         elif str(field.value) not in values:
-            changed.add(field.key)
+            changed.add(tag)
     for field in after.fields:
+        tag = field.exiftool_tag or field.key
         if (
-            field.key not in before_keys
+            tag.lower() not in before_tags
             and not field.is_computed
             and field.is_sensitive
             and field.key not in analyzer.FILESYSTEM_DATE_KEYS
         ):
-            changed.add(field.key)
+            changed.add(tag)
     return changed, removed
 
 
@@ -307,7 +321,7 @@ def _changed_categories(before: FileReport, after: FileReport, keys: set[str]) -
         _effective_category(field)
         for report in (before, after)
         for field in report.fields
-        if field.key in keys
+        if _matches_field_keys(field, keys)
     }
     return [category for category in order if category in present]
 
@@ -499,10 +513,7 @@ def _preview_spoof_plan(report: FileReport, profile: SpoofProfile, smart: bool) 
     fields = report.by_key()
     gps_lat = fields.get("GPSLatitude")
     gps_lon = fields.get("GPSLongitude")
-    has_gps_metadata = any(
-        field.category == "gps" and field.value not in (None, "", [])
-        for field in report.fields
-    )
+    has_gps_metadata = _find_gps_field(report) is not None
     gps_target_text: str | None = None
     if smart:
         if gps_lat and gps_lon and gps_lat.value not in (None, "") and gps_lon.value not in (None, ""):
@@ -525,24 +536,28 @@ def _preview_spoof_plan(report: FileReport, profile: SpoofProfile, smart: bool) 
 
     make = fields.get("Make")
     model = fields.get("Model")
+    has_make = bool(make and make.value not in (None, ""))
     device_will_change = (
-        (smart and make is not None)
+        (smart and has_make)
         or (not smart and bool(profile.device_make and profile.device_model))
     )
     if device_will_change:
         device_text = "random device"
         if profile.device_make and profile.device_model:
             device_text = f"{profile.device_make} {profile.device_model}"
-        elif smart:
-            current_make = str(make.value) if make and make.value else None
-            current_model = str(model.value) if model and model.value else None
-            candidates = [item for item in get_all_devices() if item.make != current_make or item.model != current_model]
-            if candidates:
-                device_text = f"{candidates[0].make} {candidates[0].model}"
         table.add_row("Device Model", f"{make.value if make else '—'} {model.value if model else ''}".strip(), device_text)
         changes.append("device")
 
-    date_field = next((field for field in report.fields if field.category == "dates"), None)
+    date_field = next(
+        (
+            field
+            for field in report.fields
+            if field.category == "dates"
+            and field.key not in analyzer.FILESYSTEM_DATE_KEYS
+            and (not smart or field.is_sensitive)
+        ),
+        None,
+    )
     dates_will_change = (smart and date_field is not None) or (not smart and profile.dates_mode != "keep")
     if dates_will_change:
         if smart or profile.dates_mode == "random":
@@ -556,15 +571,15 @@ def _preview_spoof_plan(report: FileReport, profile: SpoofProfile, smart: bool) 
         table.add_row("Create Date", _field_value(date_field.value) if date_field else "—", target)
         changes.append("dates")
 
-    author_field = next((field for field in report.fields if field.category == "author"), None)
-    if author_field and (smart or profile.author is not None):
+    author_fields = _existing_author_fields(report)
+    if author_fields and (smart or profile.author is not None):
         if smart:
             target = "random name"
         elif profile.author == "":
             target = "removed"
         else:
             target = str(profile.author)
-        table.add_row("Author", _field_value(author_field.value), target)
+        table.add_row("Author", _field_value(author_fields[0].value), target)
         changes.append("author")
 
     return table, changes
@@ -617,12 +632,12 @@ def _remove_residual_fields(path: Path, fields: list[MetaField]) -> int:
 
 
 def _residual_fields(report: FileReport, spoofed_keys: set[str]) -> list[MetaField]:
-    keys = {_canonical_key(key) for key in spoofed_keys}
+    keys = set(spoofed_keys)
     residual: list[MetaField] = []
     for field in report.fields:
         if not field.is_sensitive or field.is_computed:
             continue
-        if _field_aliases(field) & keys:
+        if _matches_field_keys(field, keys):
             continue
         residual.append(field)
     return residual
@@ -815,11 +830,11 @@ def clean(
             )
             progress.update(task, completed=100)
 
-        console.print(f"[bold green]✓ Cleaned:[/bold green] {result.name}")
-        console.print(f"Removed [bold red]{sensitive}[/bold red] sensitive fields.")
         console.print(f"[dim white]Saved to:[/dim white] {result}")
         if not _render_verification(result):
             raise typer.Exit(1)
+        console.print(f"[bold green]✓ Cleaned:[/bold green] {result.name}")
+        console.print(f"Removed [bold red]{sensitive}[/bold red] sensitive fields.")
     except (typer.Exit, typer.Abort):
         raise
     except Exception as exc:
@@ -861,7 +876,7 @@ def spoof(
             profile.device_make = make
             profile.device_model = model
         if author:
-            profile.author = "" if author == "remove" else author
+            profile.author = "" if author.strip().lower() == "remove" else author
 
         final_target = _default_spoof_output(file, output)
         _ensure_output_differs(file, final_target)
@@ -925,7 +940,7 @@ def spoof(
                     _apply_cli_statuses(
                         reloaded,
                         spoofed_keys=changed_keys,
-                        removed_keys=removed_keys | {field.key for field in residual_candidates},
+                        removed_keys=removed_keys | {field.exiftool_tag or field.key for field in residual_candidates},
                     )
 
         final_risk = _risk_count(reloaded)
@@ -937,6 +952,11 @@ def spoof(
             _print_info_codes(info_codes)
         console.print(f"[dim white]Saved to:[/dim white] {final_path}")
         console.print(f"Risk reduced: [bold red]{original_risk}[/bold red] → [bold green]{final_risk}[/bold green] fields")
+        if changed_fields > 0:
+            console.print(
+                f"[dim white]Note: {changed_fields} field(s) now hold spoofed values; "
+                "'dms verify' checks for fully stripped files.[/dim white]"
+            )
     except (typer.Exit, typer.Abort):
         raise
     except Exception as exc:
