@@ -240,3 +240,23 @@ def test_save_all_batch_prompts_before_overwriting_existing_files(tmp_path, monk
         assert window.batch_sessions[0].is_modified is True
     finally:
         window.close()
+
+
+def test_locales_are_complete_translated_and_keep_placeholders() -> None:
+    import string
+    from dms.interfaces.gui.theme import LOCALES
+
+    neutral_keys = {"app_title", "full_title", "drop_formats"}
+    en = LOCALES["en"]
+    formatter = string.Formatter()
+
+    def placeholders(text: str) -> set[str]:
+        return {fname for _, fname, _, _ in formatter.parse(text) if fname is not None}
+
+    for lang in ("ru", "zh"):
+        bucket = LOCALES[lang]
+        assert set(bucket) == set(en)
+        identical = {key for key, value in en.items() if bucket[key] == value}
+        assert identical <= neutral_keys, f"{lang} has untranslated keys: {sorted(identical - neutral_keys)}"
+        for key, en_val in en.items():
+            assert placeholders(bucket[key]) == placeholders(en_val), f"{lang}.{key} placeholder mismatch"
