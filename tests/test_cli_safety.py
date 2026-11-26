@@ -306,3 +306,75 @@ def test_cli_spoof_author_remove_clears_author_tags(tmp_path) -> None:
     fields = analyze(source.with_name(f"{source.stem}_spoofed{source.suffix}")).by_key()
     assert "Artist" not in fields
     assert "Creator" not in fields
+
+
+def test_expand_batch_inputs_supports_absolute_glob(tmp_path) -> None:
+    first = tmp_path / "a.jpg"
+    second = tmp_path / "b.jpg"
+    ignored = tmp_path / "c.png"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    ignored.write_bytes(b"c")
+
+    expanded = cli._expand_batch_inputs([Path(str(tmp_path / "*.jpg"))])
+
+    assert expanded == [first, second]
+
+
+def test_remove_residual_fields_uses_minor_flag_strips_signature_and_restores_fs_date(tmp_path, monkeypatch) -> None:
+    import subprocess
+    from datetime import datetime
+
+    target = tmp_path / "photo.jpg"
+    target.write_bytes(b"x")
+    calls: list[list[str]] = []
+    sig_calls: list[Path] = []
+    fs_calls: list[tuple[Path, datetime]] = []
+
+    def fake_run(args, **_kwargs):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli, "require_exiftool", lambda: "exiftool")
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "remove_exiftool_signature", lambda p, _et: sig_calls.append(p))
+    monkeypatch.setattr(cli, "set_filesystem_dates", lambda p, dt: fs_calls.append((p, dt)))
+
+    anchor = datetime(2022, 6, 15, 12, 0, 0)
+    field = MetaField("XMP:Rights", "Rights", "Rights", "val", "other", True, True)
+    removed = cli._remove_residual_fields(target, [field], fs_date=anchor)
+
+    assert removed == 1
+    assert "-m" in calls[0]
+    assert sig_calls == [target]
+    assert fs_calls == [(target, anchor)]
+
+
+def test_batch_and_watch_reject_invalid_mode(tmp_path) -> None:
+    photo = _copy_fixture(tmp_path)
+
+    batch_result = runner.invoke(cli.app, ["batch", str(photo), "--mode", "spoof_clean", "--yes"])
+    assert batch_result.exit_code != 0
+    assert "Invalid mode" in batch_result.output
+
+    watch_result = runner.invoke(cli.app, ["watch", str(tmp_path), "--mode", "invalid_mode"])
+    assert watch_result.exit_code != 0
+    assert "Invalid mode" in watch_result.output
+
+
+def test_spoof_raw_asks_proceed_only_once(tmp_path, monkeypatch) -> None:
+    from dms.core.models import FileReport
+
+    raw_file = tmp_path / "shot.dng"
+    raw_file.write_bytes(b"raw")
+    report = FileReport(
+        path=raw_file,
+        file_type="raw",
+        fields=[MetaField("EXIF:Make", "Make", "Make", "Canon", "device", True, True)],
+    )
+    monkeypatch.setattr(cli.analyzer, "analyze", lambda _p: report)
+
+    result = runner.invoke(cli.app, ["spoof", str(raw_file)], input="n\n")
+
+    assert result.output.count("Proceed?") == 1
+    assert result.exit_code == 0

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -30,10 +31,16 @@ from dms.core import analyzer
 from dms.core.device_db import get_all_devices, get_all_makes, get_models_by_make, get_random_device, get_random_vintage
 from dms.core.error_messages import classify_exiftool_error, get_error
 from dms.core.exiftool_tags import validate_exif_tag
-from dms.core.models import FileReport, MetaField, SpoofProfile
+from dms.core.models import FileReport, MetaField, SpoofProfile, parse_metadata_datetime
 from dms.core.sanitizer import OutputPathError, build_output_path, remove_all
-from dms.core.spoofer import _existing_author_fields, _find_gps_field, apply_smart_spoof, apply_spoof
-from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags
+from dms.core.spoofer import (
+    _existing_author_fields,
+    _find_gps_field,
+    apply_smart_spoof,
+    apply_spoof,
+    set_filesystem_dates,
+)
+from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags, remove_exiftool_signature
 from dms.interfaces.watcher import DMSEventHandler
 
 
@@ -596,18 +603,39 @@ def _expand_batch_inputs(files: list[Path]) -> list[Path]:
     for file in files:
         pattern = str(file)
         if any(token in pattern for token in ["*", "?", "["]):
-            expanded.extend(sorted(Path().glob(pattern)))
+            expanded.extend(Path(match) for match in sorted(glob.glob(pattern, recursive=True)))
         else:
             expanded.append(file)
     return [path for path in expanded if path.exists() and path.is_file()]
 
 
-def _remove_residual_fields(path: Path, fields: list[MetaField]) -> int:
+def _validate_mode(mode: str) -> str:
+    normalized = mode.strip().lower()
+    if normalized not in {"clean", "spoof"}:
+        raise typer.BadParameter(f"Invalid mode: {mode}. Use 'clean' or 'spoof'.")
+    return normalized
+
+
+def _extract_anchor_date(report: FileReport) -> datetime | None:
+    for field in report.fields:
+        if field.category == "dates" and field.key not in analyzer.FILESYSTEM_DATE_KEYS:
+            parsed = parse_metadata_datetime(field.value)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _remove_residual_fields(
+    path: Path,
+    fields: list[MetaField],
+    *,
+    fs_date: datetime | None = None,
+) -> int:
     removable = [field for field in fields if not field.is_computed]
     if not removable:
         return 0
     exiftool = require_exiftool()
-    args = [exiftool]
+    args = [exiftool, "-m"]
     applied = 0
     for field in removable:
         try:
@@ -628,6 +656,9 @@ def _remove_residual_fields(path: Path, fields: list[MetaField]) -> int:
     result = subprocess.run(args, capture_output=True, check=False, timeout=EXIFTOOL_TIMEOUT, creationflags=get_subprocess_flags(), **EXIFTOOL_TEXT_KWARGS)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "Failed to remove residual fields.")
+    remove_exiftool_signature(path, exiftool)
+    if fs_date is not None:
+        set_filesystem_dates(path, fs_date)
     return applied
 
 
@@ -696,7 +727,11 @@ def _process_spoof(
     if residual and auto_remove_residual:
         residual_fields = _residual_fields(reloaded, changed_keys)
         residual_keys = {field.key for field in residual_fields}
-        removed_residual = _remove_residual_fields(result, residual_fields)
+        removed_residual = _remove_residual_fields(
+            result,
+            residual_fields,
+            fs_date=_extract_anchor_date(reloaded),
+        )
         if removed_residual:
             reloaded = analyzer.analyze(result)
             _apply_cli_statuses(reloaded, spoofed_keys=changed_keys, removed_keys=removed_keys | residual_keys)
@@ -861,8 +896,6 @@ def spoof(
         if report.file_type == "raw":
             console.print("[yellow]RAW file detected.[/yellow]")
             console.print("[dim white]Some proprietary tags cannot be modified.[/dim white]")
-            if not yes and not typer.confirm("Proceed?", default=False):
-                raise typer.Abort()
         original_risk = _risk_count(report)
         if report.analysis_status != "ok":
             console.print(f"[bold yellow]! Warning:[/bold yellow] {report.analysis_error or 'metadata could not be read completely.'}")
@@ -935,7 +968,11 @@ def spoof(
                 )
                 console.print(residual_table)
                 if _confirm("Remove these fields?", yes=yes):
-                    removed_residual = _remove_residual_fields(final_path, residual_candidates)
+                    removed_residual = _remove_residual_fields(
+                        final_path,
+                        residual_candidates,
+                        fs_date=_extract_anchor_date(reloaded),
+                    )
                     reloaded = analyzer.analyze(final_path)
                     _apply_cli_statuses(
                         reloaded,
@@ -1057,6 +1094,7 @@ def watch(
         )
 
     try:
+        mode = _validate_mode(mode)
         print_banner()
         folder.mkdir(parents=True, exist_ok=True)
         output_dir: Path | None = (folder / "dms_cleaned") if collect_subfolder else None
@@ -1166,6 +1204,7 @@ def batch(
     """Clean or spoof many files in one run (no live watching)."""
 
     try:
+        mode = _validate_mode(mode)
         print_banner()
         expanded = _expand_batch_inputs(files)
         if not expanded:

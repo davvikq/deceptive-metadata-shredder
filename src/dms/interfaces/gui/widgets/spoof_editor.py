@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import string
 from datetime import datetime, timedelta, timezone
@@ -398,8 +399,7 @@ class SpoofEditor(GlassCard):
 
     def _smart_spoof(self) -> None:
         try:
-            lat = float(self.lat_edit.text())
-            lon = float(self.lon_edit.text())
+            lat, lon = self._parse_gps_coords()
         except ValueError:
             self.validationError.emit("gps_invalid_coords")
             return
@@ -509,9 +509,15 @@ class SpoofEditor(GlassCard):
         self.readonly_warning.setVisible(not is_writable)
         self.apply_button.setEnabled(is_writable)
 
-    def _gps_payload(self) -> tuple[dict[str, object], dict[str, str]]:
+    def _parse_gps_coords(self) -> tuple[float, float]:
         lat = float(self.lat_edit.text())
         lon = float(self.lon_edit.text())
+        if not (math.isfinite(lat) and math.isfinite(lon) and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise ValueError("Coordinates out of range")
+        return lat, lon
+
+    def _gps_payload(self) -> tuple[dict[str, object], dict[str, str]]:
+        lat, lon = self._parse_gps_coords()
         writes = {"GPSLatitude": lat, "GPSLongitude": lon}
         display = {"GPSLatitude": f"{lat:.6f}", "GPSLongitude": f"{lon:.6f}"}
         return writes, display
@@ -546,7 +552,7 @@ class SpoofEditor(GlassCard):
             else:
                 writes, display = self._text_payload()
         except ValueError:
-            self.validationError.emit("gps_invalid_coords")
+            self.validationError.emit("gps_invalid_coords" if self.mode == "gps" else "unexpected_error")
             return
         except Exception:
             self.validationError.emit("unexpected_error")

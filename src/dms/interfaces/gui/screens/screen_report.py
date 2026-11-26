@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, Property, QPropertyAnimation, Qt, Signal
@@ -397,13 +398,19 @@ class ScreenReport(QWidget):
         self.file_badge_host.addWidget(TagBadge.for_format(self.report.file_type, self.left_card))
         self.file_badge_host.addStretch(1)
 
+        pixmap = QPixmap()
         if self.report.thumbnail:
-            image = Image.open(io.BytesIO(self.report.thumbnail))
-            image.thumbnail((160, 120))
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            pixmap = QPixmap()
-            pixmap.loadFromData(buffer.getvalue())
+            try:
+                image = Image.open(io.BytesIO(self.report.thumbnail))
+                image.thumbnail((160, 120))
+                buffer = io.BytesIO()
+                image.save(buffer, format="PNG")
+                pixmap.loadFromData(buffer.getvalue())
+            except Exception as exc:
+                logging.debug("Could not decode report thumbnail: %s", exc)
+                pixmap = QPixmap()
+
+        if not pixmap.isNull():
             self.preview_label.setPixmap(pixmap)
             self.preview_label.setText("")
         else:

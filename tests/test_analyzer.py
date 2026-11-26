@@ -193,3 +193,10 @@ def test_pdf_analysis_warns_about_annotations_and_attachments(tmp_path) -> None:
 
     assert analyzer.PDF_LIMITATION_WARNING in report.warnings
     assert any("1 annotation(s)" in w and "1 attachment(s)" in w for w in report.warnings)
+
+
+def test_analyze_directory_raises_is_a_directory_error() -> None:
+    import pytest
+
+    with pytest.raises(IsADirectoryError):
+        analyze(FIXTURES)

@@ -260,3 +260,43 @@ def test_locales_are_complete_translated_and_keep_placeholders() -> None:
         assert identical <= neutral_keys, f"{lang} has untranslated keys: {sorted(identical - neutral_keys)}"
         for key, en_val in en.items():
             assert placeholders(bucket[key]) == placeholders(en_val), f"{lang}.{key} placeholder mismatch"
+
+
+def test_spoof_editor_gps_validates_range_and_non_gps_value_error(tmp_path) -> None:
+    from dms.interfaces.gui.widgets.spoof_editor import SpoofEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = SpoofEditor(lambda: "en")
+    errors: list[str] = []
+    editor.validationError.connect(errors.append)
+
+    gps_field = _field("GPSLatitude", category="gps", exiftool_tag="EXIF:GPSLatitude")
+    report = _report(tmp_path / "photo.jpg", [gps_field])
+    editor.set_context(report, gps_field)
+    editor.lat_edit.setText("999")
+    editor.lon_edit.setText("999")
+    editor._emit_apply()
+
+    assert errors == ["gps_invalid_coords"]
+
+    errors.clear()
+    text_field = _field("Artist", category="author", exiftool_tag="EXIF:Artist")
+    editor.set_context(_report(tmp_path / "photo.jpg", [text_field]), text_field)
+    editor._text_payload = lambda: (_ for _ in ()).throw(ValueError("bad text"))
+    editor._emit_apply()
+
+    assert errors == ["unexpected_error"]
+
+
+def test_screen_report_falls_back_on_corrupted_thumbnail(tmp_path) -> None:
+    from dms.interfaces.gui.screens.screen_report import ScreenReport
+
+    app = QApplication.instance() or QApplication([])
+    screen = ScreenReport(lambda: "en")
+    photo = tmp_path / "corrupt_thumb.dng"
+    photo.write_bytes(b"raw")
+    report = FileReport(path=photo, file_type="raw", fields=[], thumbnail=b"not-a-valid-image")
+
+    screen.set_report(report, {}, display_path=photo)
+
+    assert "RAW" in screen.preview_label.text()

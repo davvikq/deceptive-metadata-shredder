@@ -665,6 +665,10 @@ def analyze(path: Path) -> FileReport:
     file_path = Path(path)
     if not file_path.exists():
         raise FileNotFoundError(file_path)
+    if file_path.is_dir():
+        raise IsADirectoryError(file_path)
+    if not file_path.is_file():
+        raise FileNotFoundError(file_path)
 
     file_type = detect_file_type(file_path)
     suffix = file_path.suffix.lower()

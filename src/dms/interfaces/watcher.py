@@ -31,6 +31,8 @@ class DMSEventHandler(FileSystemEventHandler):
         include_all: bool = False,
     ):
         super().__init__()
+        if mode not in {"clean", "spoof"}:
+            raise ValueError(f"Unsupported mode: {mode}. Use 'clean' or 'spoof'.")
         self.mode = mode
         self.callback = callback
         self.output_dir = Path(output_dir) if output_dir is not None else None
