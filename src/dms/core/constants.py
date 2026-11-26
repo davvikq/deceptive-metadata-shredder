@@ -72,6 +72,9 @@ DEVICE_TAGS_TO_CLEAR = [
     "CreatorTool",
     "HostComputer",
     "UniqueCameraModel",
+    "MakerNotes:All",
+    "ThumbnailImage",
+    "PreviewImage",
 ]
 
 DATE_TAGS_TO_SPOOF = [

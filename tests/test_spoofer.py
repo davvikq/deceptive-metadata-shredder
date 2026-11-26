@@ -1040,3 +1040,143 @@ def test_pdf_smart_spoof_spoofs_producer_and_skips_new_xmp(tmp_path) -> None:
 
     assert fields["Producer"].value != "pypdf"
     assert not any(field.exiftool_tag.upper().startswith("XMP") for field in reloaded.fields)
+    raw = result.read_bytes()
+    assert b"Jane Doe" not in raw
+    assert b"pypdf" not in raw
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_pdf_guided_spoof_removes_original_author_bytes(tmp_path) -> None:
+    source = tmp_path / "doc.pdf"
+    source.write_bytes((FIXTURES / "test_document.pdf").read_bytes())
+
+    result = apply_spoof(
+        analyze(source),
+        SpoofProfile(gps_mode="manual", gps_target=None, author="Alice Smith", dates_mode="keep"),
+    )
+
+    raw = result.read_bytes()
+    assert b"Jane Doe" not in raw
+    assert analyze(result).by_key()["Author"].value == "Alice Smith"
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_argfile_blocks_newline_injection(tmp_path) -> None:
+    source = tmp_path / "photo.jpg"
+    source.write_bytes((FIXTURES / "test_with_gps.jpg").read_bytes())
+    subprocess.run(
+        [get_exiftool_path(), "-overwrite_original", "-EXIF:Artist=Orig", str(source)],
+        check=True,
+        capture_output=True,
+    )
+
+    result = apply_spoof(
+        analyze(source),
+        SpoofProfile(
+            gps_mode="manual",
+            gps_target=None,
+            author="Jane\n-Copyright=Injected",
+            dates_mode="keep",
+        ),
+    )
+
+    fields = analyze(result).by_key()
+    assert "Copyright" not in fields
+    assert fields["Artist"].value == "Jane -Copyright=Injected"
+
+
+def test_device_spoof_clears_makernotes_and_thumbnail() -> None:
+    from dms.core.constants import DEVICE_TAGS_TO_CLEAR
+
+    assert "MakerNotes:All" in DEVICE_TAGS_TO_CLEAR
+    assert "ThumbnailImage" in DEVICE_TAGS_TO_CLEAR
+    assert "PreviewImage" in DEVICE_TAGS_TO_CLEAR
+
+
+def test_guided_spoof_deletes_region_and_always_delete_tags(tmp_path, monkeypatch) -> None:
+    import subprocess as _subprocess
+    from dms.core.constants import REGION_XMP_NUKE_ARGS
+
+    source = tmp_path / "source.jpg"
+    source.write_bytes(b"jpeg-data")
+    captured_clears: list[list[str]] = []
+    captured_subprocess_args: list[list[str]] = []
+
+    def fake_run_edits(destination, clears, writes, *, soft_fail=False):
+        captured_clears.append(list(clears))
+        return True
+
+    def fake_subprocess_run(args, **kwargs):
+        captured_subprocess_args.append(list(args))
+        return _subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(spoofer_module, "get_exiftool_path", lambda: "exiftool")
+    monkeypatch.setattr(spoofer_module, "require_exiftool", lambda: "exiftool")
+    monkeypatch.setattr(spoofer_module, "_run_exiftool_edits", fake_run_edits)
+    monkeypatch.setattr(spoofer_module.subprocess, "run", fake_subprocess_run)
+
+    report = FileReport(
+        path=source,
+        file_type="jpeg",
+        fields=[
+            MetaField("EXIF:Artist", "Artist", "Artist", "Alice", "author", True, True),
+            MetaField("XMP-mwg-rs:RegionExtensionsFaceID", "RegionExtensionsFaceID", "Face ID", "abc-123", "other", True, True, is_computed=True),
+            MetaField("EXIF:AccelerationVector", "AccelerationVector", "Acceleration", "0.1 0.2 9.8", "other", True, True, is_computed=True),
+        ],
+    )
+
+    apply_spoof(report, SpoofProfile(gps_mode="manual", gps_target=None, author="Bob", dates_mode="keep"))
+
+    assert any(any(arg in REGION_XMP_NUKE_ARGS for arg in call) for call in captured_subprocess_args)
+    all_clears = [tag for batch in captured_clears for tag in batch]
+    assert "EXIF:AccelerationVector" in all_clears
+
+
+@pytest.mark.skipif(not get_exiftool_path(), reason="exiftool is required for spoof tests")
+def test_docx_spoof_cleans_company_comments_and_tracked_changes(tmp_path) -> None:
+    import zipfile
+    from lxml import etree
+
+    source = tmp_path / "authored.docx"
+    rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    content_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+    app_ns = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+    with zipfile.ZipFile(FIXTURES / "test_document.docx") as original, zipfile.ZipFile(source, "w") as authored:
+        for info in original.infolist():
+            payload = original.read(info.filename)
+            if info.filename == "word/document.xml":
+                doc_text = payload.decode("utf-8").replace(
+                    "</w:body>",
+                    '<w:p><w:del w:id="1" w:author="Real Author"><w:r><w:delText>DELETED_SECRET</w:delText></w:r></w:del></w:p></w:body>',
+                    1,
+                )
+                payload = doc_text.encode("utf-8")
+            elif info.filename == "docProps/app.xml":
+                root = etree.fromstring(payload)
+                etree.SubElement(root, f"{{{app_ns}}}Company").text = "Secret Corp"
+                payload = etree.tostring(root, encoding="UTF-8", xml_declaration=True)
+            elif info.filename == "_rels/.rels":
+                root = etree.fromstring(payload)
+                etree.SubElement(root, f"{{{rel_ns}}}Relationship", Id="rIdCustom", Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties", Target="docProps/custom.xml")
+                payload = etree.tostring(root, encoding="UTF-8", xml_declaration=True)
+            elif info.filename == "word/_rels/document.xml.rels":
+                root = etree.fromstring(payload)
+                etree.SubElement(root, f"{{{rel_ns}}}Relationship", Id="rIdComments", Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments", Target="comments.xml")
+                payload = etree.tostring(root, encoding="UTF-8", xml_declaration=True)
+            elif info.filename == "[Content_Types].xml":
+                root = etree.fromstring(payload)
+                etree.SubElement(root, f"{{{content_ns}}}Override", PartName="/docProps/custom.xml", ContentType="application/vnd.openxmlformats-officedocument.custom-properties+xml")
+                etree.SubElement(root, f"{{{content_ns}}}Override", PartName="/word/comments.xml", ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml")
+                payload = etree.tostring(root, encoding="UTF-8", xml_declaration=True)
+            authored.writestr(info, payload)
+        authored.writestr("docProps/custom.xml", '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"><property name="Owner"><value>Real Author</value></property></Properties>')
+        authored.writestr("word/comments.xml", '<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="0" w:author="Real Author" w:initials="RA"><w:p><w:r><w:t>Keep note</w:t></w:r></w:p></w:comment></w:comments>')
+
+    result, _, _ = apply_smart_spoof(analyze(source))
+
+    with zipfile.ZipFile(result) as archive:
+        assert b"Secret Corp" not in archive.read("docProps/app.xml")
+        assert b"Real Author" not in archive.read("docProps/custom.xml")
+        assert b"Real Author" not in archive.read("word/comments.xml")
+        assert b"Keep note" in archive.read("word/comments.xml")
+        assert b"DELETED_SECRET" not in archive.read("word/document.xml")

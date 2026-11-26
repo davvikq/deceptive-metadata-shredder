@@ -529,24 +529,28 @@ def _analyze_docx(path: Path) -> tuple[list[MetaField], str, str | None]:
     else:
         status = "partial"
         error = "exiftool not found; DOCX analysis is limited."
-    # Load from memory so python-docx does not hold an open file handle to path.
-    document = Document(io.BytesIO(path.read_bytes()))
-    props = document.core_properties
-    for key, value in {
-        "Author": props.author,
-        "LastModifiedBy": props.last_modified_by,
-        "Company": getattr(props, "company", None),
-        "Created": props.created,
-        "Modified": props.modified,
-        "Revision": props.revision,
-    }.items():
-        if not any(field.key == key for field in fields):
-            _safe_append(fields, key, value)
+    # Stream instead of reading the whole DOCX into memory; validate ZIP limits first.
+    from dms.core.sanitizer import validate_zip_archive
+
     has_tracked_changes = False
     with zipfile.ZipFile(path) as archive:
+        validate_zip_archive(archive)
         if "word/document.xml" in archive.namelist():
             content = archive.read("word/document.xml").decode("utf-8", errors="ignore")
             has_tracked_changes = "<w:ins" in content or "<w:del" in content
+    with path.open("rb") as stream:
+        document = Document(stream)
+        props = document.core_properties
+        for key, value in {
+            "Author": props.author,
+            "LastModifiedBy": props.last_modified_by,
+            "Company": getattr(props, "company", None),
+            "Created": props.created,
+            "Modified": props.modified,
+            "Revision": props.revision,
+        }.items():
+            if not any(field.key == key for field in fields):
+                _safe_append(fields, key, value)
     if not any(field.key == "HasTrackedChanges" for field in fields):
         _safe_append(fields, "HasTrackedChanges", has_tracked_changes)
     return fields, status, error

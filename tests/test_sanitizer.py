@@ -243,7 +243,7 @@ def test_docx_clean_uses_plausible_staggered_zip_dates(tmp_path) -> None:
     assert len(set(timestamps)) > 1
 
 
-def test_pillow_jpeg_fallback_preserves_orientation_icc_and_quality(tmp_path, monkeypatch) -> None:
+def test_pillow_jpeg_fallback_strips_icc_by_default_and_preserves_orientation(tmp_path, monkeypatch) -> None:
     import piexif
     from PIL import Image
     from dms.core import sanitizer
@@ -259,11 +259,16 @@ def test_pillow_jpeg_fallback_preserves_orientation_icc_and_quality(tmp_path, mo
 
     with Image.open(source) as result:
         assert result.size == (20, 40)
-        assert result.info.get("icc_profile") == icc
+        assert "icc_profile" not in result.info
         assert not result.getexif()
 
+    img.save(source, format="JPEG", quality=95, exif=exif_bytes, icc_profile=icc)
+    sanitizer._sanitize_image_without_exiftool(source, strip_icc=False)
+    with Image.open(source) as result:
+        assert result.info.get("icc_profile") == icc
 
-def test_pillow_png_fallback_strips_text_chunks_and_keeps_icc(tmp_path) -> None:
+
+def test_pillow_png_fallback_strips_text_chunks_and_icc_by_default(tmp_path) -> None:
     from PIL import Image, PngImagePlugin
     from dms.core import sanitizer
 
@@ -280,8 +285,13 @@ def test_pillow_png_fallback_strips_text_chunks_and_keeps_icc(tmp_path) -> None:
     with Image.open(source) as result:
         assert "Author" not in result.info
         assert "Comment" not in result.info
-        assert result.info.get("icc_profile") == icc
+        assert "icc_profile" not in result.info
     assert b"Secret Author" not in source.read_bytes()
+
+    img.save(source, format="PNG", pnginfo=pnginfo, icc_profile=icc)
+    sanitizer._sanitize_image_without_exiftool(source, strip_icc=False)
+    with Image.open(source) as result:
+        assert result.info.get("icc_profile") == icc
 
 
 def test_clean_mp4_zeros_quicktime_dates_and_passes_verify(tmp_path) -> None:
@@ -321,3 +331,104 @@ def test_clean_mp4_zeros_quicktime_dates_and_passes_verify(tmp_path) -> None:
     cleaned = remove_all(source, tmp_path / "clip_cleaned.mp4")
 
     assert verify(cleaned) == []
+
+
+def test_pdf_clean_strips_annotation_rc_subj_and_popup_author(tmp_path) -> None:
+    from pypdf.generic import DictionaryObject
+
+    source = tmp_path / "rich_annot.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    popup = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/Popup"),
+            NameObject("/T"): TextStringObject("Popup Author"),
+            NameObject("/M"): TextStringObject("D:20240101000000"),
+        }
+    )
+    popup_ref = writer._add_object(popup)
+    annotation = Text(rect=(20, 20, 40, 40), text="Body text")
+    annotation[NameObject("/T")] = TextStringObject("Main Author")
+    annotation[NameObject("/Subj")] = TextStringObject("Secret Subject")
+    annotation[NameObject("/RC")] = TextStringObject("<p>Rich Author</p>")
+    annotation[NameObject("/Popup")] = popup_ref
+    writer.add_annotation(page_number=0, annotation=annotation)
+    writer.write(source)
+
+    cleaned = remove_all(source, tmp_path / "rich_annot_cleaned.pdf")
+    raw = cleaned.read_bytes()
+    reader = PdfReader(cleaned)
+    saved_annot = reader.pages[0]["/Annots"][0].get_object()
+    saved_popup = saved_annot["/Popup"].get_object()
+
+    assert saved_annot["/Contents"] == "Body text"
+    for key in ("/T", "/Subj", "/RC", "/M", "/CreationDate"):
+        assert key not in saved_annot
+    assert "/T" not in saved_popup
+    assert "/M" not in saved_popup
+    assert b"Rich Author" not in raw
+    assert b"Popup Author" not in raw
+    assert b"Secret Subject" not in raw
+
+
+def test_docx_clean_removes_thumbnail_customxml_attached_template_and_media_exif(tmp_path) -> None:
+    gps_jpg = FIXTURES / "test_with_gps.jpg"
+    prepared = tmp_path / "with_pic.docx"
+    doc = Document(str(FIXTURES / "test_document.docx"))
+    doc.add_picture(str(gps_jpg))
+    doc.save(str(prepared))
+
+    source = tmp_path / "rich.docx"
+    overrides = {
+        "word/settings.xml": (
+            b'<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            b'<w:attachedTemplate r:id="rId1" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>'
+            b'<w:rsids><w:rsidRoot w:val="00112233"/></w:rsids></w:settings>'
+        ),
+        "word/people.xml": (
+            b'<w15:people xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml">'
+            b'<w15:person w15:author="Secret Person"/></w15:people>'
+        ),
+    }
+    with zipfile.ZipFile(prepared) as original, zipfile.ZipFile(source, "w") as out:
+        seen: set[str] = set()
+        for info in original.infolist():
+            seen.add(info.filename)
+            out.writestr(info.filename, overrides.get(info.filename, original.read(info.filename)))
+        for name, data in overrides.items():
+            if name not in seen:
+                out.writestr(name, data)
+
+    cleaned = remove_all(source, tmp_path / "rich_cleaned.docx")
+
+    with zipfile.ZipFile(cleaned) as archive:
+        names = set(archive.namelist())
+        assert "docProps/thumbnail.jpeg" not in names
+        assert not any(n.startswith("customXml/") for n in names)
+        assert "word/people.xml" not in names
+        settings = archive.read("word/settings.xml").decode("utf-8")
+        assert "attachedTemplate" not in settings
+        assert "rsids" not in settings
+        media_names = [n for n in names if n.startswith("word/media/")]
+        assert media_names
+        media_img = tmp_path / "extracted.jpg"
+        media_img.write_bytes(archive.read(media_names[0]))
+        assert "GPSLatitude" not in analyze(media_img).by_key()
+
+
+def test_docx_zip_bomb_is_rejected(tmp_path) -> None:
+    bomb = tmp_path / "bomb.docx"
+    with zipfile.ZipFile(bomb, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b"A" * (12 * 1024 * 1024))
+
+    extract_dir = tmp_path / "out"
+    extract_dir.mkdir()
+    with zipfile.ZipFile(bomb) as archive:
+        with pytest.raises(ValueError, match="compression ratio"):
+            _safe_extractall(archive, extract_dir)
+
+    with pytest.raises(ValueError, match="compression ratio"):
+        from dms.core.analyzer import _analyze_docx
+
+        _analyze_docx(bomb)

@@ -33,13 +33,41 @@ class OutputPathError(ValueError):
     """Raised when an output path would overwrite the source file."""
 
 
-# Reject obviously truncated outputs (metadata edits rarely shrink the payload this much).
+# Reject obviously truncated outputs (metadata/attachment edits can legitimately shrink large wrappers).
 _ATOMIC_MIN_ABSOLUTE = 256
-_ATOMIC_RATIO_FLOOR = 0.05
+_ATOMIC_RATIO_FLOOR = 0.005
+
+_MAX_ZIP_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
+_MAX_ZIP_COMPRESSION_RATIO = 100
+_MAX_ZIP_ENTRIES = 10_000
+
+
+def validate_zip_archive(archive: zipfile.ZipFile) -> None:
+    """Reject ZIP bombs based on entry count, uncompressed size, and compression ratio."""
+
+    infos = archive.infolist()
+    if len(infos) > _MAX_ZIP_ENTRIES:
+        raise ValueError(f"ZIP archive has too many entries ({len(infos)})")
+    total_uncompressed = 0
+    total_compressed = 0
+    for member in infos:
+        if member.file_size < 0 or member.compress_size < 0:
+            raise ValueError("Invalid negative size in ZIP entry.")
+        if member.file_size > 10 * 1024 * 1024:
+            if member.compress_size == 0 or (member.file_size / member.compress_size) > _MAX_ZIP_COMPRESSION_RATIO:
+                raise ValueError(f"Suspicious compression ratio in ZIP entry: {member.filename}")
+        total_uncompressed += member.file_size
+        total_compressed += member.compress_size
+        if total_uncompressed > _MAX_ZIP_UNCOMPRESSED_BYTES:
+            raise ValueError("ZIP archive exceeds maximum uncompressed size limit.")
+    if total_uncompressed > 10 * 1024 * 1024:
+        if total_compressed == 0 or (total_uncompressed / total_compressed) > _MAX_ZIP_COMPRESSION_RATIO:
+            raise ValueError("Suspicious overall compression ratio in ZIP archive.")
 
 
 def _safe_extractall(archive: zipfile.ZipFile, target_dir: Path) -> None:
-    """Extract ZIP members while preventing ZipSlip path traversal."""
+    """Extract ZIP members while preventing ZipSlip path traversal and ZIP bombs."""
+    validate_zip_archive(archive)
     resolved_target = target_dir.resolve()
     for member in archive.infolist():
         member_path = (resolved_target / member.filename).resolve()
@@ -70,7 +98,7 @@ def _validate_atomic_output(source_size: int, result_path: Path) -> None:
     if source_size >= 4096 and result_size < _ATOMIC_MIN_ABSOLUTE:
         raise RuntimeError("Refusing to replace destination: processed file is implausibly small.")
     ratio = result_size / source_size
-    if source_size >= 4096 and ratio < _ATOMIC_RATIO_FLOOR:
+    if source_size >= 4096 and result_size < 16_384 and ratio < _ATOMIC_RATIO_FLOOR:
         raise RuntimeError("Refusing to replace destination: processed file lost most of the data.")
 
 
@@ -251,12 +279,16 @@ def remove_field(
     return destination
 
 
-def _sanitize_image_without_exiftool(destination: Path) -> None:
+def _sanitize_image_without_exiftool(destination: Path, *, strip_icc: bool = True) -> None:
     suffix = destination.suffix.lower()
     if suffix in {".jpg", ".jpeg"}:
         try:
             piexif.remove(str(destination))
-            return
+            if not strip_icc:
+                return
+            with Image.open(destination) as check_img:
+                if not check_img.info.get("icc_profile"):
+                    return
         except Exception as exc:
             logging.warning(
                 "piexif EXIF removal failed for %s (%s); falling back to Pillow re-encode",
@@ -264,7 +296,7 @@ def _sanitize_image_without_exiftool(destination: Path) -> None:
                 exc,
             )
     with Image.open(destination) as image:
-        icc_profile = image.info.get("icc_profile")
+        icc_profile = None if strip_icc else image.info.get("icc_profile")
         if suffix in {".jpg", ".jpeg"}:
             clean = ImageOps.exif_transpose(image)
             if clean.mode not in {"RGB", "L", "CMYK"}:
@@ -281,6 +313,7 @@ def _sanitize_image_without_exiftool(destination: Path) -> None:
         if suffix == ".png":
             dpi = image.info.get("dpi")
             clean = image.copy()
+            clean.info.clear()
             save_kwargs = {"format": "PNG"}
             if icc_profile:
                 save_kwargs["icc_profile"] = icc_profile
@@ -290,6 +323,8 @@ def _sanitize_image_without_exiftool(destination: Path) -> None:
             return
         clean = image.copy()
         clean.info.pop("exif", None)
+        if strip_icc:
+            clean.info.pop("icc_profile", None)
         clean.save(destination)
 
 
@@ -319,6 +354,23 @@ def _purge_pdf_object(obj: object, seen: set[int], protected_ids: set[int]) -> N
         for item in list(obj):
             _purge_pdf_object(item, seen, protected_ids)
         obj.clear()
+
+
+def _strip_pdf_annotation_metadata(page: object) -> None:
+    for reference in page.get("/Annots", []):
+        annotation = reference.get_object()
+        subtype = annotation.get("/Subtype")
+        if subtype == "/Widget":
+            annotation.pop(NameObject("/M"), None)
+            annotation.pop(NameObject("/CreationDate"), None)
+            continue
+        for key in ("/T", "/M", "/CreationDate", "/RC", "/Subj", "/NM"):
+            annotation.pop(NameObject(key), None)
+        popup_ref = annotation.get("/Popup")
+        if popup_ref is not None:
+            popup = popup_ref.get_object()
+            for key in ("/T", "/M", "/CreationDate", "/RC", "/Subj"):
+                popup.pop(NameObject(key), None)
 
 
 def _sanitize_pdf(
@@ -385,12 +437,7 @@ def _sanitize_pdf(
                 if strip_annotations:
                     page.pop(NameObject("/Annots"), None)
                 else:
-                    for reference in page.get("/Annots", []):
-                        annotation = reference.get_object()
-                        if annotation.get("/Subtype") != "/Widget":
-                            annotation.pop(NameObject("/T"), None)
-                            annotation.pop(NameObject("/M"), None)
-                            annotation.pop(NameObject("/CreationDate"), None)
+                    _strip_pdf_annotation_metadata(page)
                 if strip_attachments:
                     af_page = page.pop(NameObject("/AF"), None)
                     if af_page is not None:
@@ -437,6 +484,156 @@ def _strip_docx_tracked_changes(document_xml: Path) -> None:
     document_xml.write_text(ET.tostring(root, encoding="unicode"), encoding="utf-8")
 
 
+def _prune_docx_part_references(extract_root: Path) -> None:
+    """Remove rels and content-type overrides pointing to stripped OOXML parts."""
+
+    removed_prefixes = ("docProps/thumbnail", "customXml/", "word/people.xml", "people.xml")
+    xml_parser = etree.XMLParser(resolve_entities=False, no_network=True)
+
+    for rels_path in [extract_root / "_rels" / ".rels", *sorted((extract_root / "word" / "_rels").glob("*.rels"))]:
+        if not rels_path.exists():
+            continue
+        tree = etree.parse(str(rels_path), parser=xml_parser)
+        changed = False
+        for rel in list(tree.getroot()):
+            target = (rel.attrib.get("Target") or "").lstrip("/")
+            if target.startswith("../"):
+                target = target[3:]
+            if any(target.startswith(prefix) for prefix in removed_prefixes):
+                tree.getroot().remove(rel)
+                changed = True
+        if changed:
+            tree.write(str(rels_path), encoding="UTF-8", xml_declaration=True)
+
+    content_types = extract_root / "[Content_Types].xml"
+    if content_types.exists():
+        tree = etree.parse(str(content_types), parser=xml_parser)
+        changed = False
+        for elem in list(tree.getroot()):
+            part_name = (elem.attrib.get("PartName") or "").lstrip("/")
+            if any(part_name.startswith(prefix) for prefix in removed_prefixes):
+                tree.getroot().remove(elem)
+                changed = True
+        if changed:
+            tree.write(str(content_types), encoding="UTF-8", xml_declaration=True)
+
+
+def _author_initials(name: str) -> str:
+    parts = [part[0].upper() for part in name.split() if part]
+    return "".join(parts[:3]) or "A"
+
+
+def clean_docx_extracted_parts(
+    extract_root: Path,
+    *,
+    clear_docprops: bool = True,
+    sanitize_media: bool = True,
+    fake_author: str | None = None,
+    preserve_comment_authors: bool = False,
+) -> None:
+    """Strip tracked revisions, stray properties, thumbnails, customXml, RSIDs, and media EXIF."""
+
+    word_root = extract_root / "word"
+    xml_parser = etree.XMLParser(resolve_entities=False, no_network=True)
+
+    tracked_change_parts = [
+        word_root / "document.xml",
+        word_root / "footnotes.xml",
+        word_root / "endnotes.xml",
+        *sorted(word_root.glob("header*.xml")),
+        *sorted(word_root.glob("footer*.xml")),
+    ]
+    for xml_path in tracked_change_parts:
+        if xml_path.exists():
+            _strip_docx_tracked_changes(xml_path)
+
+    doc_props = extract_root / "docProps"
+    for thumb in sorted(doc_props.glob("thumbnail.*")) if doc_props.exists() else []:
+        thumb.unlink(missing_ok=True)
+    custom_xml_dir = extract_root / "customXml"
+    if custom_xml_dir.exists():
+        shutil.rmtree(custom_xml_dir, ignore_errors=True)
+    people_xml = word_root / "people.xml"
+    if people_xml.exists():
+        people_xml.unlink(missing_ok=True)
+    _prune_docx_part_references(extract_root)
+
+    if clear_docprops:
+        for properties_name in ("core.xml", "custom.xml", "app.xml"):
+            properties_xml = doc_props / properties_name
+            if properties_xml.exists():
+                tree = etree.parse(str(properties_xml), parser=xml_parser)
+                tree.getroot().clear()
+                tree.write(str(properties_xml), encoding="UTF-8", xml_declaration=True)
+    else:
+        custom_props = doc_props / "custom.xml"
+        if custom_props.exists():
+            tree = etree.parse(str(custom_props), parser=xml_parser)
+            tree.getroot().clear()
+            tree.write(str(custom_props), encoding="UTF-8", xml_declaration=True)
+        app_props = doc_props / "app.xml"
+        if app_props.exists():
+            tree = etree.parse(str(app_props), parser=xml_parser)
+            changed = False
+            for child in list(tree.getroot()):
+                if etree.QName(child).localname in {"Company", "Manager", "Template", "Application", "AppVersion"}:
+                    tree.getroot().remove(child)
+                    changed = True
+            if changed:
+                tree.write(str(app_props), encoding="UTF-8", xml_declaration=True)
+
+    settings_xml = word_root / "settings.xml"
+    if settings_xml.exists():
+        tree = etree.parse(str(settings_xml), parser=xml_parser)
+        changed = False
+        for child in list(tree.getroot()):
+            if etree.QName(child).localname in {"attachedTemplate", "rsids"}:
+                tree.getroot().remove(child)
+                changed = True
+        if changed:
+            tree.write(str(settings_xml), encoding="UTF-8", xml_declaration=True)
+
+    initials = _author_initials(fake_author) if fake_author else None
+    for xml_path in word_root.rglob("*.xml"):
+        tree = etree.parse(str(xml_path), parser=xml_parser)
+        changed = False
+        for element in tree.iter():
+            for attribute in list(element.attrib):
+                local = etree.QName(attribute).localname.lower()
+                if local.startswith("rsid"):
+                    del element.attrib[attribute]
+                    changed = True
+                elif local in {"author", "initials", "userid", "providerid", "email"}:
+                    if fake_author and local == "author":
+                        element.attrib[attribute] = fake_author
+                        changed = True
+                    elif initials and local == "initials":
+                        element.attrib[attribute] = initials
+                        changed = True
+                    elif preserve_comment_authors and local in {"author", "initials"}:
+                        continue
+                    else:
+                        del element.attrib[attribute]
+                        changed = True
+        if changed:
+            tree.write(str(xml_path), encoding="UTF-8", xml_declaration=True)
+
+    if sanitize_media:
+        media_dir = word_root / "media"
+        if media_dir.exists():
+            for media_file in sorted(media_dir.iterdir()):
+                if not media_file.is_file():
+                    continue
+                msuffix = media_file.suffix.lower()
+                if msuffix not in {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp"}:
+                    continue
+                try:
+                    _sanitize_with_exiftool(media_file)
+                except (RuntimeError, subprocess.SubprocessError, FileNotFoundError):
+                    if msuffix in {".jpg", ".jpeg", ".png"}:
+                        _sanitize_image_without_exiftool(media_file)
+
+
 def _sanitize_docx(destination: Path) -> None:
     """Clear OOXML properties and revision/comment attribution."""
     document = Document(str(destination))
@@ -457,38 +654,7 @@ def _sanitize_docx(destination: Path) -> None:
         with zipfile.ZipFile(destination) as archive:
             _safe_extractall(archive, extract_root)
 
-        word_root = extract_root / "word"
-        tracked_change_parts = [
-            word_root / "document.xml",
-            word_root / "footnotes.xml",
-            word_root / "endnotes.xml",
-            *sorted(word_root.glob("header*.xml")),
-            *sorted(word_root.glob("footer*.xml")),
-        ]
-        for xml_path in tracked_change_parts:
-            if xml_path.exists():
-                _strip_docx_tracked_changes(xml_path)
-
-        # Document properties and revision/comment authors live in different
-        # OOXML parts. Clearing only python-docx core_properties misses them.
-        for properties_name in ("core.xml", "custom.xml", "app.xml"):
-            properties_xml = extract_root / "docProps" / properties_name
-            if properties_xml.exists():
-                tree = etree.parse(str(properties_xml), parser=etree.XMLParser(resolve_entities=False, no_network=True))
-                tree.getroot().clear()
-                tree.write(str(properties_xml), encoding="UTF-8", xml_declaration=True)
-
-        for xml_path in word_root.rglob("*.xml"):
-            tree = etree.parse(str(xml_path), parser=etree.XMLParser(resolve_entities=False, no_network=True))
-            changed = False
-            for element in tree.iter():
-                for attribute in list(element.attrib):
-                    if etree.QName(attribute).localname.lower() in {"author", "initials", "userid", "providerid", "email"}:
-                        del element.attrib[attribute]
-                        changed = True
-            if changed:
-                tree.write(str(xml_path), encoding="UTF-8", xml_declaration=True)
-
+        clean_docx_extracted_parts(extract_root, clear_docprops=True, sanitize_media=True)
         _write_zip_with_dates(extract_root, destination)
 
 

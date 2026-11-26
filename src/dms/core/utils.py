@@ -23,6 +23,12 @@ def get_subprocess_flags() -> int:
     return 0
 
 
+def _sanitize_argfile_option(option: str) -> str:
+    """Strip line breaks and NUL bytes so values cannot inject extra argfile flags."""
+
+    return option.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("\x00", "")
+
+
 def run_exiftool_with_argfile(
     exiftool_path: str,
     destination: Path,
@@ -34,7 +40,12 @@ def run_exiftool_with_argfile(
     non-ASCII values. A UTF-8 argfile preserves them for EXIF and XMP writes.
     """
 
-    payload = ("\n".join(options) + "\n").encode("utf-8")
+    sanitized = [
+        cleaned
+        for item in options
+        if (cleaned := _sanitize_argfile_option(item)) and cleaned.startswith("-")
+    ]
+    payload = ("\n".join(sanitized) + "\n").encode("utf-8")
     fd, argfile_name = tempfile.mkstemp(prefix=".dms_args_", suffix=".txt")
     argfile = Path(argfile_name)
     try:

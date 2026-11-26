@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 import subprocess
+import tempfile
+import zipfile
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from docx import Document
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import NameObject
 
 from dms.config import get_exiftool_path, require_exiftool
 from dms.core import geo_validator
@@ -28,7 +33,14 @@ from dms.core.constants import (
 from dms.core.device_db import get_all_devices, get_models_by_make, get_random_device
 from dms.core.exiftool_tags import validate_exif_tag
 from dms.core.models import FileReport, MetaField, SpoofProfile, parse_metadata_datetime
-from dms.core.sanitizer import repack_docx_zip_dates, resolve_spoof_destination, run_atomic_file_update
+from dms.core.sanitizer import (
+    _safe_extractall,
+    _strip_pdf_annotation_metadata,
+    _write_zip_with_dates,
+    clean_docx_extracted_parts,
+    resolve_spoof_destination,
+    run_atomic_file_update,
+)
 from dms.core.utils import EXIFTOOL_TEXT_KWARGS, EXIFTOOL_TIMEOUT, get_subprocess_flags, remove_exiftool_signature, run_exiftool_with_argfile
 
 _PROFILE_CREATOR_POOL = ("MSFT", "GOOG", "ADBE", "SUNW")
@@ -218,6 +230,99 @@ def _datetime_to_zip_time(dt: datetime) -> tuple[int, int, int, int, int, int]:
     return (max(dt.year, 1980), dt.month, dt.day, dt.hour, dt.minute, dt.second)
 
 
+def _rewrite_docx_clean(
+    destination: Path,
+    zip_dt: tuple[int, int, int, int, int, int] | None,
+    *,
+    fake_author: str | None = None,
+    preserve_comment_authors: bool = False,
+) -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        extract_root = Path(tmp_dir)
+        with zipfile.ZipFile(destination) as archive:
+            _safe_extractall(archive, extract_root)
+        clean_docx_extracted_parts(
+            extract_root,
+            clear_docprops=False,
+            sanitize_media=True,
+            fake_author=fake_author,
+            preserve_comment_authors=preserve_comment_authors,
+        )
+        _write_zip_with_dates(extract_root, destination, zip_dt)
+
+
+def _rewrite_pdf_spoofed(
+    destination: Path,
+    *,
+    author: str | None = None,
+    producer: str | None = None,
+    anchor_date: datetime | None = None,
+    remove_dates: bool = False,
+    remove_author: bool = False,
+) -> None:
+    """Rebuild PDF without incremental history so old /Info and XMP bytes cannot leak."""
+
+    fd, rewritten_str = tempfile.mkstemp(prefix=".dms_pdf_", suffix=".pdf", dir=destination.parent)
+    rewritten = Path(rewritten_str)
+    try:
+        with os.fdopen(fd, "wb") as output, destination.open("rb") as source:
+            reader = PdfReader(source)
+            orig_meta = reader.metadata or {}
+            writer = PdfWriter()
+            writer.clone_document_from_reader(reader)
+            writer.metadata = None
+            writer.xmp_metadata = b""
+            writer.xmp_metadata = None
+            for page in writer.pages:
+                page_metadata = page.get("/Metadata")
+                if page_metadata is not None:
+                    page_metadata.get_object().set_data(b"")
+                    del page[NameObject("/Metadata")]
+                _strip_pdf_annotation_metadata(page)
+
+            new_info: dict[str, str] = {}
+            for preserved_key in ("/Title", "/Subject", "/Keywords"):
+                val = orig_meta.get(preserved_key)
+                if val not in (None, ""):
+                    new_info[preserved_key] = str(val)
+
+            if not remove_author:
+                if author is not None:
+                    if author:
+                        new_info["/Author"] = author
+                        if orig_meta.get("/Creator") not in (None, ""):
+                            new_info["/Creator"] = author
+                else:
+                    for key in ("/Author", "/Creator"):
+                        val = orig_meta.get(key)
+                        if val not in (None, ""):
+                            new_info[key] = str(val)
+
+            if producer is not None:
+                if producer:
+                    new_info["/Producer"] = producer
+            elif orig_meta.get("/Producer") not in (None, ""):
+                new_info["/Producer"] = str(orig_meta["/Producer"])
+
+            if not remove_dates:
+                if anchor_date is not None:
+                    pdf_dt = anchor_date.strftime("D:%Y%m%d%H%M%S+00'00'")
+                    new_info["/CreationDate"] = pdf_dt
+                    new_info["/ModDate"] = pdf_dt
+                else:
+                    for key in ("/CreationDate", "/ModDate"):
+                        val = orig_meta.get(key)
+                        if val not in (None, ""):
+                            new_info[key] = str(val)
+
+            if new_info:
+                writer.add_metadata(new_info)
+            writer.write(output)
+        os.replace(rewritten, destination)
+    finally:
+        rewritten.unlink(missing_ok=True)
+
+
 def _apply_docx_dates(destination: Path, value: datetime, remove: bool = False) -> bool:
     document = Document(str(destination))
     _clear_python_docx_signature(document)
@@ -234,7 +339,7 @@ def _apply_docx_dates(destination: Path, value: datetime, remove: bool = False) 
         document.core_properties.modified = value
     document.save(str(destination))
     zip_dt = None if remove else _datetime_to_zip_time(value)
-    repack_docx_zip_dates(destination, zip_dt)
+    _rewrite_docx_clean(destination, zip_dt, preserve_comment_authors=True)
     return True
 
 
@@ -641,7 +746,7 @@ def _apply_docx_author(
         elif normalized == "lastmodifiedby":
             props.last_modified_by = fake_name
     document.save(str(destination))
-    repack_docx_zip_dates(destination, zip_date)
+    _rewrite_docx_clean(destination, zip_date, fake_author=fake_name or None)
     return True
 
 
@@ -731,12 +836,36 @@ def apply_spoof(
         final = resolve_spoof_destination(file_report.path)
 
     def work(destination: Path) -> None:
-        clears: list[str] = []
-        writes: dict[str, object] = {}
-
+        file_type = file_report.file_type.lower()
         dates_anchor: datetime | None = None
         if profile.dates_mode not in {"keep", "remove"}:
             dates_anchor = _resolve_spoof_anchor_date(file_report, profile)
+
+        if file_type == "pdf":
+            pdf_author = profile.author if profile.author else None
+            remove_author = profile.author == ""
+            pdf_date = None
+            remove_dates = profile.dates_mode == "remove"
+            if profile.dates_mode not in {"keep", "remove"}:
+                pdf_date = dates_anchor or _resolve_spoof_anchor_date(file_report, profile)
+            _rewrite_pdf_spoofed(
+                destination,
+                author=pdf_author,
+                anchor_date=pdf_date,
+                remove_dates=remove_dates,
+                remove_author=remove_author,
+            )
+            fs_date: datetime | None = None
+            if remove_dates:
+                fs_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=random.randint(180, 2000))
+            elif profile.dates_mode != "keep":
+                fs_date = pdf_date
+            if fs_date is not None:
+                _set_filesystem_dates(destination, fs_date, exiftool_path)
+            return
+
+        clears: list[str] = []
+        writes: dict[str, object] = {}
 
         has_gps_metadata = _find_gps_field(file_report) is not None
         gps_target = _resolve_gps_target(file_report, profile)
@@ -766,17 +895,17 @@ def apply_spoof(
             if str(existing_profile_creator).lower() == "appl" and "ProfileCreator" not in writes:
                 writes["ProfileCreator"] = _spoofed_profile_creator(existing_profile_creator)
 
-        if file_report.file_type.lower() != "docx":
+        if file_type != "docx":
             writes.update(_author_updates(profile, file_report))
 
         _run_exiftool_edits(destination, list(dict.fromkeys(clears)), writes)
 
-        if file_report.file_type.lower() == "docx" and profile.author is not None:
+        if file_type == "docx" and profile.author is not None:
             docx_author_fields = _existing_author_fields(file_report)
             if docx_author_fields:
                 _apply_docx_author(destination, profile.author, docx_author_fields)
 
-        fs_date: datetime | None = None
+        fs_date = None
         if profile.dates_mode != "keep":
             if profile.dates_mode == "remove":
                 _apply_dates_to_destination(destination, file_report, None, remove=True)
@@ -791,6 +920,7 @@ def apply_spoof(
                     raise RuntimeError("Failed to update date metadata.")
                 fs_date = dates_anchor
 
+        _nuke_always_delete_tags(destination, file_report)
         remove_exiftool_signature(destination, exiftool_path)
         if fs_date is not None:
             _set_filesystem_dates(destination, fs_date, exiftool_path)
@@ -850,6 +980,35 @@ def apply_smart_spoof(
             shift_days = -random.randint(180, 1000)
             base_date = _resolve_date_value(file_report)[0] or datetime.now(timezone.utc).replace(tzinfo=None)
             dates_anchor = base_date + timedelta(days=shift_days)
+
+        if file_report.file_type.lower() == "pdf":
+            pdf_author = None
+            if _author_exists(file_report):
+                progress("Spoofing author...")
+                try:
+                    from faker import Faker
+
+                    pdf_author = Faker().name()
+                except Exception:
+                    pdf_author = "John Smith"
+                changes.append("author")
+            pdf_producer = None
+            if _find_field(file_report, "producer"):
+                progress("Spoofing producer...")
+                pdf_producer = random.choice(_PDF_PRODUCER_POOL)
+                changes.append("software")
+            if has_dates and dates_anchor is not None:
+                progress("Spoofing dates...")
+                changes.append("dates")
+            _rewrite_pdf_spoofed(
+                destination,
+                author=pdf_author,
+                producer=pdf_producer,
+                anchor_date=dates_anchor if has_dates else None,
+            )
+            if dates_anchor is not None:
+                _set_filesystem_dates(destination, dates_anchor, exiftool_path)
+            return
 
         gps_lat = _find_field(file_report, "gpslatitude")
         gps_lon = _find_field(file_report, "gpslongitude")
