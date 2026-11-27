@@ -55,6 +55,33 @@ DOC_SUFFIXES = {".docx"}
 PDF_SUFFIXES = {".pdf"}
 HEIC_SUFFIXES = {".heic", ".heif"}
 RAW_SUFFIXES = {suffix for suffix, kind in SUPPORTED_FORMATS.items() if kind == "raw"}
+
+FORMAT_DISPLAY_NAMES: dict[str, str] = {
+    "jpeg": "JPEG",
+    "png": "PNG",
+    "heic": "HEIC",
+    "heif": "HEIF",
+    "tiff": "TIFF",
+    "webp": "WebP",
+    "raw": "RAW",
+    "pdf": "PDF",
+    "docx": "DOCX",
+    "mp4": "MP4",
+    "mov": "MOV",
+}
+
+
+def supported_format_labels() -> list[str]:
+    """Return ordered human-readable format labels derived from SUPPORTED_FORMATS."""
+
+    present = set(SUPPORTED_FORMATS.values())
+    ordered = [label for kind, label in FORMAT_DISPLAY_NAMES.items() if kind in present]
+    for kind in SUPPORTED_FORMATS.values():
+        if kind not in FORMAT_DISPLAY_NAMES:
+            label = kind.upper()
+            if label not in ordered:
+                ordered.append(label)
+    return ordered
 RAW_READONLY_TAGS = {"InternalSerialNumber"}
 IMAGE_PARSE_WARNING = "Image metadata could not be fully parsed. Showing limited report."
 IMAGE_THUMBNAIL_WARNING = "Could not render image preview thumbnail."

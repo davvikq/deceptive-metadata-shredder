@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Remove or replace EXIF, GPS, device IDs, timestamps, and authorship in JPEG, PNG, HEIC, TIFF, RAW, PDF, DOCX, MP4, MOV — entirely on your machine.
+  Remove or replace EXIF, GPS, device IDs, timestamps, and authorship in JPEG, PNG, HEIC, HEIF, TIFF, WebP, RAW, PDF, DOCX, MP4, MOV — entirely on your machine.
 </p>
 
 <p align="center">
@@ -51,7 +51,7 @@ DMS solves both. It runs **entirely offline** with no network calls. And beyond 
 | Drag-and-drop GUI                          | ✅ PySide6                    | ❌ (CLI only)    | ⚠️ basic       | ✅ macOS only |
 | CLI for scripting                          | ✅                            | ✅               | ✅             | ❌            |
 | Cross-platform                             | Win / macOS / Linux          | all             | Linux / macOS | macOS         |
-| Supported formats                          | JPEG, PNG, HEIC, TIFF, RAW, PDF, DOCX, MP4, MOV | very many | many | images |
+| Supported formats                          | JPEG, PNG, HEIC, HEIF, TIFF, WebP, RAW, PDF, DOCX, MP4, MOV | very many | many | images |
 | License                                    | MIT                          | Artistic        | LGPL-3.0      | GPL          |
 
 If you want raw breadth, ExifTool is unbeatable. DMS sits **on top of ExifTool** for the heavy lifting and adds a GUI, smart spoofing, watch folders, and sensible defaults so non-experts don't shoot themselves in the foot.
@@ -95,7 +95,7 @@ That installs two commands on your PATH:
 
 ### Windows portable executable
 
-Download `DMS_Portable.exe` from the [latest release](https://github.com/davvikq/deceptive-metadata-shredder/releases). ExifTool is bundled — nothing else to install.
+Download `DMS_Portable.zip` (contains `DMS_Portable.exe`) or `DMS_Setup.exe` from the [latest release](https://github.com/davvikq/deceptive-metadata-shredder/releases). ExifTool is bundled — nothing else to install.
 
 ### From source
 
@@ -111,6 +111,12 @@ python -m venv .venv
 # macOS / Linux
 source .venv/bin/activate
 
+# CLI only (headless)
+pip install -e .
+
+# CLI + PySide6 GUI
+pip install -e ".[gui]"
+# or with full requirements
 pip install -r requirements.txt
 pip install -e .
 ```
@@ -170,12 +176,13 @@ dms batch ./a.jpg ./b.png --output-dir ./out --mode spoof --yes
 | `dms --version`        | Version, Python, and ExifTool status                                                              |
 | `dms analyze <file>`   | List metadata. `--format` is `table`, `json`, or `minimal`. Read-only.                            |
 | `dms verify <file>`    | Report any sensitive metadata still present. Read-only; exits non-zero if the file is not clean.   |
-| `dms clean <file>`     | Remove all metadata into a new file (`*_cleaned` by default). `-o` sets path. `--yes` skips prompt.|
+| `dms clean <file>`     | Remove all metadata into a new file (`*_cleaned` by default). Flags: `-o`, `--yes`, `--strip-annotations`, `--strip-attachments`. |
 | `dms spoof <file>`     | Smart or guided spoofing. Flags: `--gps`, `--device`, `--author`, `--dates`, `-o`, `--yes`, `--residual`. ExifTool required. |
-| `dms watch <folder>`   | Watch for **new** files. `--mode clean\|spoof`, `--recursive`, `--collect-subfolder`, `--all`. Ctrl+C stops. |
-| `dms batch <paths...>` | Many files or globs in one run. `--mode clean\|spoof`, `--output-dir`, `--yes`, `--residual`.       |
+| `dms devices`          | List available bundled device IDs for `--device`. Supports `--format table\|json`.               |
+| `dms watch <folder>`   | Watch for **new** files. `--mode clean\|spoof\|spoof_clean`, `--recursive`, `--collect-subfolder`, `--all`, `--strip-annotations`, `--strip-attachments`. Ctrl+C stops. |
+| `dms batch <paths...>` | Many files or globs in one run. `--mode clean\|spoof\|spoof_clean`, `--output-dir`, `--yes`, `--residual`, `--strip-annotations`, `--strip-attachments`. |
 
-Errors are logged to `dms_errors.log` in the working directory (or a temp path if that fails).
+Errors are logged to `dms_errors.log` in the working directory (or a temp path if that fails) for CLI/source runs. Frozen GUI builds write errors to `%APPDATA%\DeceptiveMetadataShredder\dms_errors.log` on Windows, `~/Library/Logs/DeceptiveMetadataShredder/dms_errors.log` on macOS, and `$XDG_STATE_HOME/deceptive-metadata-shredder/dms_errors.log` (or `~/.local/state/deceptive-metadata-shredder/dms_errors.log`) on Linux.
 
 ---
 
@@ -200,7 +207,7 @@ Runs PyInstaller and, if [Inno Setup 6](https://jrsoftware.org/isinfo.php) is in
 | `DMS_Portable.exe` | Single portable GUI executable (ExifTool bundled)          |
 | `DMS_Setup.exe`    | Installer (only if Inno Setup was found)                   |
 
-On **macOS** / **Linux** use `scripts/build_exe.sh`. The output binary is `dist/DMS` and expects a system ExifTool.
+On **macOS** / **Linux** use `scripts/build_exe.sh`. The output binary is `dist/DMS-macos` (macOS) or `dist/DMS-linux` (Linux) and expects a system ExifTool.
 
 GitHub Actions builds for all platforms when you push a version tag matching `v*.*.*`.
 
@@ -233,7 +240,7 @@ Yes. There are no network calls. GPS spoofing uses bundled Natural Earth GeoJSON
 No. DMS always writes a new copy (e.g. `photo_cleaned.jpg` or `photo_spoofed.jpg`) and leaves your original untouched.
 
 **Which formats are supported?**
-JPEG, PNG, HEIC, TIFF, WebP, RAW, PDF, DOCX, MP4, MOV, and others. ExifTool is recommended for full coverage; without it, DMS falls back to Pillow and built-in readers for JPG / PNG / PDF / DOCX.
+JPEG, PNG, HEIC, HEIF, TIFF, WebP, RAW (`CR2`, `CR3`, `NEF`, `NRW`, `ARW`, `SRF`, `SR2`, `DNG`, `RAF`, `ORF`, `RW2`, `PEF`, `X3F`), PDF, DOCX, MP4, MOV. ExifTool is recommended for full coverage; without it, DMS falls back to Pillow and built-in readers for JPG / PNG / PDF / DOCX.
 
 **DMS vs ExifTool — when should I use which?**
 ExifTool is a powerful Swiss-army-knife CLI with the broadest format support. DMS sits on top of ExifTool and adds a GUI, smart spoofing logic, watch folders, and safer defaults. For scripting niche workflows, use ExifTool directly. For a click-and-go privacy tool, use DMS.

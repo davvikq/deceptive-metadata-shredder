@@ -461,10 +461,18 @@ def get_log_path() -> Path:
     """Return a writable log path for GUI errors."""
 
     if getattr(sys, "frozen", False):
-        app_data = Path(os.environ.get("APPDATA", Path.home()))
-        log_dir = app_data / "DeceptiveMetadataShredder"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        return log_dir / "dms_errors.log"
+        if sys.platform.startswith("win"):
+            log_dir = Path(os.environ.get("APPDATA", Path.home())) / "DeceptiveMetadataShredder"
+        elif sys.platform == "darwin":
+            log_dir = Path.home() / "Library" / "Logs" / "DeceptiveMetadataShredder"
+        else:
+            state_home = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+            log_dir = Path(state_home) / "deceptive-metadata-shredder"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            return log_dir / "dms_errors.log"
+        except OSError:
+            return Path(tempfile.gettempdir()) / "dms_errors.log"
     cwd_log = Path.cwd() / "dms_errors.log"
     try:
         cwd_log.touch(exist_ok=True)
@@ -662,6 +670,7 @@ class BatchWorker(QThread):
             if f.exiftool_tag not in {r.exiftool_tag for r in residual_fields}
         ]
         total = len(residual_fields) + len(always_delete)
+        ran_exiftool = has_region
         if all_standard:
             exiftool = require_exiftool()
             args = [exiftool, "-m"]
@@ -689,6 +698,21 @@ class BatchWorker(QThread):
                 stderr = (result.stderr or "").strip()
                 if result.returncode != 0 and not _is_exiftool_warnings_only(stderr):
                     raise RuntimeError(stderr or "Failed to clean residual fields.")
+                ran_exiftool = True
+        if ran_exiftool:
+            remove_exiftool_signature(report.path, require_exiftool())
+            anchor_date = next(
+                (
+                    parsed
+                    for field in report.fields
+                    if field.category == "dates"
+                    and field.key not in _SYSTEM_DATE_KEYS
+                    and (parsed := parse_metadata_datetime(field.value)) is not None
+                ),
+                None,
+            )
+            if anchor_date is not None:
+                set_filesystem_dates(report.path, anchor_date)
         return total
 
     def run(self) -> None:  # pragma: no cover - thread bridge

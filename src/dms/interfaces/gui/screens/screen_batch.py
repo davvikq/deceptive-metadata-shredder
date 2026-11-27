@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from dms.core.analyzer import DOC_SUFFIXES, IMAGE_SUFFIXES, PDF_SUFFIXES, RAW_SUFFIXES, VIDEO_SUFFIXES
 from dms.interfaces.gui.theme import COLORS, tr
 from dms.interfaces.gui.widgets.glass_card import GlassCard
 
@@ -36,11 +37,11 @@ def _format_bytes(size: int) -> str:
 
 def _format_icon(path: Path) -> str:
     suffix = path.suffix.lower()
-    if suffix in {".jpg", ".jpeg", ".png", ".heic"}:
+    if suffix in (IMAGE_SUFFIXES | RAW_SUFFIXES):
         return "🖼"
-    if suffix in {".pdf", ".docx"}:
+    if suffix in (PDF_SUFFIXES | DOC_SUFFIXES):
         return "📄"
-    if suffix in {".mp4", ".mov"}:
+    if suffix in VIDEO_SUFFIXES:
         return "🎬"
     return "📦"
 

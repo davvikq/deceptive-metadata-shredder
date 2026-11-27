@@ -396,7 +396,7 @@ def _report_header(report: FileReport) -> Panel:
 
 def _render_analysis_table(report: FileReport) -> None:
     console.print(_report_header(report))
-    console.print("[dim white]Supported formats:[/dim white] JPG PNG HEIC TIFF WebP RAW PDF DOCX MP4")
+    console.print(f"[dim white]Supported formats:[/dim white] {' '.join(analyzer.supported_format_labels())}")
     for title, fields in _group_fields(report):
         console.print(Text(f"\n{title}", style="bold bright_white"))
         table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold bright_white")
@@ -593,7 +593,7 @@ def _preview_spoof_plan(report: FileReport, profile: SpoofProfile, smart: bool) 
 
 
 def _batch_target(file: Path, output_dir: Path | None, mode: str) -> Path:
-    suffix = "spoofed" if mode == "spoof" else "cleaned"
+    suffix = "spoofed" if mode in {"spoof", "spoof_clean"} else "cleaned"
     name = f"{file.stem}_{suffix}{file.suffix}"
     return output_dir / name if output_dir else file.with_name(name)
 
@@ -611,8 +611,8 @@ def _expand_batch_inputs(files: list[Path]) -> list[Path]:
 
 def _validate_mode(mode: str) -> str:
     normalized = mode.strip().lower()
-    if normalized not in {"clean", "spoof"}:
-        raise typer.BadParameter(f"Invalid mode: {mode}. Use 'clean' or 'spoof'.")
+    if normalized not in {"clean", "spoof", "spoof_clean"}:
+        raise typer.BadParameter(f"Invalid mode: {mode}. Use 'clean', 'spoof', or 'spoof_clean'.")
     return normalized
 
 
@@ -699,10 +699,21 @@ def _render_verification(path: Path) -> bool:
     return False
 
 
-def _process_clean(file: Path, output: Path | None = None) -> tuple[Path, int]:
+def _process_clean(
+    file: Path,
+    output: Path | None = None,
+    *,
+    strip_annotations: bool = False,
+    strip_attachments: bool = False,
+) -> tuple[Path, int]:
     report = analyzer.analyze(file)
     sensitive = _risk_count(report)
-    result = remove_all(file, output)
+    result = remove_all(
+        file,
+        output,
+        strip_annotations=strip_annotations,
+        strip_attachments=strip_attachments,
+    )
     return result, sensitive
 
 
@@ -1056,7 +1067,7 @@ def watch(
     mode: str = typer.Option(
         "clean",
         "--mode",
-        help="clean: strip metadata. spoof: smart spoof (needs exiftool).",
+        help="clean: strip metadata. spoof: smart spoof (needs exiftool). spoof_clean: spoof + strip residual fields.",
     ),
     recursive: bool = typer.Option(
         False,
@@ -1078,6 +1089,16 @@ def watch(
             "Only allowed with --collect-subfolder (outputs stay under dms_cleaned/ so the watcher does not loop). "
             "Paths inside dms_cleaned/ are always ignored."
         ),
+    ),
+    strip_annotations: bool = typer.Option(
+        False,
+        "--strip-annotations",
+        help="Also remove PDF annotations and comments (text, popups).",
+    ),
+    strip_attachments: bool = typer.Option(
+        False,
+        "--strip-attachments",
+        help="Also remove PDF embedded file attachments.",
     ),
 ) -> None:
     """Watch a folder and process new files as they appear (outputs are copies; sources are not edited in place).
@@ -1164,6 +1185,8 @@ def watch(
                 callback=on_file,
                 output_dir=output_dir,
                 include_all=include_all,
+                strip_annotations=strip_annotations,
+                strip_attachments=strip_attachments,
             ),
             str(folder),
             recursive=recursive,
@@ -1188,7 +1211,7 @@ def watch(
 @app.command()
 def batch(
     files: list[Path] = typer.Argument(..., help="Files and/or globs to process."),
-    mode: str = typer.Option("clean", "--mode", help="clean or spoof."),
+    mode: str = typer.Option("clean", "--mode", help="clean, spoof, or spoof_clean (spoof + strip residual fields)."),
     output_dir: Path | None = typer.Option(
         None,
         "--output-dir",
@@ -1199,6 +1222,16 @@ def batch(
         False,
         "--residual",
         help="After spoof, offer to strip leftover sensitive fields.",
+    ),
+    strip_annotations: bool = typer.Option(
+        False,
+        "--strip-annotations",
+        help="Also remove PDF annotations and comments (text, popups).",
+    ),
+    strip_attachments: bool = typer.Option(
+        False,
+        "--strip-attachments",
+        help="Also remove PDF embedded file attachments.",
     ),
 ) -> None:
     """Clean or spoof many files in one run (no live watching)."""
@@ -1249,7 +1282,7 @@ def batch(
                     if report.analysis_status != "ok":
                         console.print(f"[bold yellow]! {file.name}:[/bold yellow] {report.analysis_error or 'metadata could not be read completely.'}")
 
-                    if mode == "spoof":
+                    if mode in {"spoof", "spoof_clean"}:
                         if report.analysis_status != "ok":
                             failed += 1
                             summary.append((file.name, "—", "unverified", "✗"))
@@ -1258,11 +1291,12 @@ def batch(
                             continue
                         progress.update(tasks[file], description=f"{file.name} spoofing")
                         output = targets[file]
+                        use_residual = residual or (mode == "spoof_clean")
                         result, _, info_codes, fields_changed, removed_residual, _, _ = _process_spoof(
                             file,
                             output,
-                            residual=residual,
-                            auto_remove_residual=residual,
+                            residual=use_residual,
+                            auto_remove_residual=use_residual,
                         )
                         succeeded += 1
                         if removed_residual:
@@ -1275,7 +1309,12 @@ def batch(
                     else:
                         progress.update(tasks[file], description=f"{file.name} cleaning")
                         output = targets[file]
-                        result, removed = _process_clean(file, output)
+                        result, removed = _process_clean(
+                            file,
+                            output,
+                            strip_annotations=strip_annotations,
+                            strip_attachments=strip_attachments,
+                        )
                         try:
                             leftover = analyzer.verify(result)
                         except analyzer.MetadataAnalysisError as exc:

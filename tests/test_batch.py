@@ -39,7 +39,7 @@ def test_batch_processes_multiple_files(tmp_path, monkeypatch) -> None:
 
     processed: list[str] = []
 
-    def fake_process_clean(file: Path, output: Path | None = None):
+    def fake_process_clean(file: Path, output: Path | None = None, **_kwargs):
         processed.append(file.name)
         result = output or file.with_name(f"{file.stem}_cleaned{file.suffix}")
         result.write_bytes(file.read_bytes())
@@ -66,7 +66,7 @@ def test_batch_continues_when_one_file_fails(tmp_path, monkeypatch) -> None:
 
     processed: list[str] = []
 
-    def fake_process_clean(file: Path, output: Path | None = None):
+    def fake_process_clean(file: Path, output: Path | None = None, **_kwargs):
         processed.append(file.name)
         if file.name == "bad.jpg":
             raise RuntimeError("broken")
@@ -109,7 +109,7 @@ def test_batch_returns_failure_when_clean_leaves_residual(tmp_path, monkeypatch)
     file = tmp_path / "dirty.jpg"
     file.write_bytes(b"x")
 
-    def fake_process_clean(source: Path, output: Path | None = None):
+    def fake_process_clean(source: Path, output: Path | None = None, **_kwargs):
         result = output or source.with_name(f"{source.stem}_cleaned{source.suffix}")
         result.write_bytes(source.read_bytes())
         return result, 1
@@ -142,3 +142,60 @@ def test_dms_output_detection() -> None:
     # Edge: case insensitive
     assert looks_like_dms_output(Path("Photo_Cleaned.JPG")) is True
     assert looks_like_dms_output(Path("Photo_SPOOFED.heic")) is True
+
+
+def test_batch_clean_forwards_pdf_strip_flags(tmp_path, monkeypatch) -> None:
+    doc = tmp_path / "doc.pdf"
+    doc.write_bytes(b"%PDF-1.4")
+    received: list[dict[str, bool]] = []
+
+    def fake_process_clean(
+        file: Path,
+        output: Path | None = None,
+        *,
+        strip_annotations: bool = False,
+        strip_attachments: bool = False,
+    ):
+        received.append({"annots": strip_annotations, "attach": strip_attachments})
+        result = output or file.with_name(f"{file.stem}_cleaned{file.suffix}")
+        result.write_bytes(file.read_bytes())
+        return result, 1
+
+    monkeypatch.setattr(cli.analyzer, "analyze", lambda path: _report(Path(path)))
+    monkeypatch.setattr(cli.analyzer, "verify", lambda path: [])
+    monkeypatch.setattr(cli, "_process_clean", fake_process_clean)
+
+    result = runner.invoke(
+        cli.app,
+        ["batch", str(doc), "--mode", "clean", "--strip-annotations", "--strip-attachments", "--yes"],
+    )
+
+    assert result.exit_code == 0
+    assert received == [{"annots": True, "attach": True}]
+
+
+def test_batch_supports_spoof_clean_mode(tmp_path, monkeypatch) -> None:
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(b"jpg")
+    calls: list[dict[str, object]] = []
+
+    def fake_process_spoof(
+        file: Path,
+        output: Path | None = None,
+        *,
+        residual: bool = False,
+        auto_remove_residual: bool = False,
+    ):
+        calls.append({"output": output, "residual": residual, "auto": auto_remove_residual})
+        dest = output or file.with_name(f"{file.stem}_spoofed{file.suffix}")
+        dest.write_bytes(file.read_bytes())
+        return dest, ["gps"], [], 1, 2, 3, 0
+
+    monkeypatch.setattr(cli.analyzer, "analyze", lambda path: _report(Path(path)))
+    monkeypatch.setattr(cli, "_process_spoof", fake_process_spoof)
+
+    result = runner.invoke(cli.app, ["batch", str(photo), "--mode", "spoof_clean", "--yes"])
+
+    assert result.exit_code == 0
+    assert calls == [{"output": photo.with_name("photo_spoofed.jpg"), "residual": True, "auto": True}]
+    assert "spoofed+cleaned" in result.output

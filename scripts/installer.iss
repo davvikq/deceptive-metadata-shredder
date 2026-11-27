@@ -5,8 +5,8 @@
 #define MyAppName "Deceptive Metadata Shredder"
 #define MyAppExeName "DMS_Portable.exe"
 #define MyAppInstallerName "DMS_Setup"
-#define MyAppPublisher "Open Source Contributors"
-#define MyAppURL "https://github.com/"
+#define MyAppPublisher "davvik"
+#define MyAppURL "https://github.com/davvikq/deceptive-metadata-shredder"
 #define MyAppId "{{D9A296D2-9D53-4C95-94B4-38E0DCE7C415}"
 
 [Setup]

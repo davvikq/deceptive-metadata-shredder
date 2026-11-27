@@ -300,3 +300,59 @@ def test_screen_report_falls_back_on_corrupted_thumbnail(tmp_path) -> None:
     screen.set_report(report, {}, display_path=photo)
 
     assert "RAW" in screen.preview_label.text()
+
+
+def test_frozen_get_log_path_uses_platform_log_dirs(tmp_path, monkeypatch) -> None:
+    from dms.interfaces.gui import app as app_mod
+
+    monkeypatch.setattr(app_mod.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    monkeypatch.setattr(app_mod.sys, "platform", "win32")
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData"))
+    assert app_mod.get_log_path() == tmp_path / "AppData" / "DeceptiveMetadataShredder" / "dms_errors.log"
+
+    monkeypatch.setattr(app_mod.sys, "platform", "darwin")
+    assert app_mod.get_log_path() == tmp_path / "Library" / "Logs" / "DeceptiveMetadataShredder" / "dms_errors.log"
+
+    monkeypatch.setattr(app_mod.sys, "platform", "linux")
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    assert app_mod.get_log_path() == tmp_path / ".local" / "state" / "deceptive-metadata-shredder" / "dms_errors.log"
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
+    assert app_mod.get_log_path() == tmp_path / "xdg_state" / "deceptive-metadata-shredder" / "dms_errors.log"
+
+
+def test_batch_worker_clean_residual_strips_signature_and_restores_dates(tmp_path, monkeypatch) -> None:
+    import subprocess
+    from datetime import datetime
+    from dms.interfaces.gui import app as app_mod
+
+    target = tmp_path / "photo.jpg"
+    target.write_bytes(b"jpg")
+    report = FileReport(
+        path=target,
+        file_type="jpeg",
+        fields=[
+            MetaField("EXIF:DateTimeOriginal", "DateTimeOriginal", "Create Date", "2020:03:04 05:06:07", "dates", True, True, is_computed=False, status="spoofed"),
+            MetaField("XMP:Rights", "Rights", "Rights", "Secret", "other", True, True, is_computed=False, status="risk"),
+        ],
+    )
+    sig_calls: list[Path] = []
+    fs_calls: list[tuple[Path, datetime]] = []
+
+    monkeypatch.setattr(app_mod, "require_exiftool", lambda: "exiftool")
+    monkeypatch.setattr(
+        app_mod.subprocess,
+        "run",
+        lambda args, **_kwargs: subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(app_mod, "remove_exiftool_signature", lambda p, _et: sig_calls.append(p))
+    monkeypatch.setattr(app_mod, "set_filesystem_dates", lambda p, dt: fs_calls.append((p, dt)))
+
+    worker = app_mod.BatchWorker([], "spoof_clean", "en")
+    removed = worker._clean_residual(report)
+
+    assert removed == 1
+    assert sig_calls == [target]
+    assert fs_calls == [(target, datetime(2020, 3, 4, 5, 6, 7))]

@@ -27,7 +27,7 @@ case "$OS_NAME" in
       --additional-hooks-dir hooks/ \
       --add-data "src/dms/data:dms/data" \
       --icon=src/dms/data/icon.ico \
-      --name "DMS" \
+      --name "DMS-macos" \
       --exclude-module matplotlib \
       --exclude-module pandas \
       --exclude-module PyQt5 \
@@ -43,7 +43,7 @@ case "$OS_NAME" in
       --additional-hooks-dir hooks/ \
       --add-data "src/dms/data:dms/data" \
       --icon=src/dms/data/icon.ico \
-      --name "DMS" \
+      --name "DMS-linux" \
       --exclude-module matplotlib \
       --exclude-module pandas \
       --exclude-module PyQt5 \

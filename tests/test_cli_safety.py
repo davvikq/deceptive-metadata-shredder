@@ -353,13 +353,29 @@ def test_remove_residual_fields_uses_minor_flag_strips_signature_and_restores_fs
 def test_batch_and_watch_reject_invalid_mode(tmp_path) -> None:
     photo = _copy_fixture(tmp_path)
 
-    batch_result = runner.invoke(cli.app, ["batch", str(photo), "--mode", "spoof_clean", "--yes"])
+    batch_result = runner.invoke(cli.app, ["batch", str(photo), "--mode", "invalid_mode", "--yes"])
     assert batch_result.exit_code != 0
     assert "Invalid mode" in batch_result.output
 
     watch_result = runner.invoke(cli.app, ["watch", str(tmp_path), "--mode", "invalid_mode"])
     assert watch_result.exit_code != 0
     assert "Invalid mode" in watch_result.output
+
+
+def test_supported_formats_and_batch_icons_stay_in_sync() -> None:
+    from dms.core.analyzer import supported_format_labels
+    from dms.interfaces.gui.screens.screen_batch import _format_icon
+
+    labels = supported_format_labels()
+    for expected in ("JPEG", "PNG", "HEIC", "HEIF", "TIFF", "WebP", "RAW", "PDF", "DOCX", "MP4", "MOV"):
+        assert expected in labels
+
+    for ext in (".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".webp", ".cr2", ".dng"):
+        assert _format_icon(Path(f"sample{ext}")) == "🖼"
+    assert _format_icon(Path("doc.pdf")) == "📄"
+    assert _format_icon(Path("doc.docx")) == "📄"
+    assert _format_icon(Path("clip.mp4")) == "🎬"
+    assert _format_icon(Path("clip.mov")) == "🎬"
 
 
 def test_spoof_raw_asks_proceed_only_once(tmp_path, monkeypatch) -> None:

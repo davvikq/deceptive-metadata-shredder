@@ -13,7 +13,7 @@ def test_new_file_creates_cleaned_copy(tmp_path, monkeypatch) -> None:
     def fake_analyze(path: Path) -> FileReport:
         return FileReport(path=Path(path), file_type="jpeg", fields=[], thumbnail=None)
 
-    def fake_remove_all(report: FileReport, output_path=None):
+    def fake_remove_all(report: FileReport, output_path=None, **_kwargs):
         cleaned = (
             output_path
             if output_path is not None
@@ -46,7 +46,7 @@ def test_collect_subfolder_writes_under_dms_cleaned(tmp_path, monkeypatch) -> No
     def fake_analyze(path: Path) -> FileReport:
         return FileReport(path=Path(path), file_type="jpeg", fields=[], thumbnail=None)
 
-    def fake_remove_all(report: FileReport, output_path=None):
+    def fake_remove_all(report: FileReport, output_path=None, **_kwargs):
         cleaned = (
             output_path
             if output_path is not None
@@ -117,7 +117,7 @@ def test_include_all_processes_cleaned_suffix_into_subfolder(tmp_path, monkeypat
     def fake_analyze(path: Path) -> FileReport:
         return FileReport(path=Path(path), file_type="jpeg", fields=[], thumbnail=None)
 
-    def fake_remove_all(report: FileReport, output_path=None):
+    def fake_remove_all(report: FileReport, output_path=None, **_kwargs):
         cleaned = (
             output_path
             if output_path is not None
@@ -145,3 +145,91 @@ def test_include_all_processes_cleaned_suffix_into_subfolder(tmp_path, monkeypat
 
     assert (out_dir / "image_cleaned_cleaned.jpg").exists()
     assert processed == [(source, 0, True)]
+
+
+def test_watcher_forwards_pdf_strip_flags(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "doc.pdf"
+    source.write_bytes(b"%PDF-1.4")
+    received: list[tuple[bool, bool]] = []
+
+    def fake_analyze(path: Path) -> FileReport:
+        return FileReport(path=Path(path), file_type="pdf", fields=[], thumbnail=None)
+
+    def fake_remove_all(
+        report: FileReport,
+        output_path=None,
+        *,
+        strip_annotations: bool = False,
+        strip_attachments: bool = False,
+    ):
+        received.append((strip_annotations, strip_attachments))
+        cleaned = output_path or report.path.with_name(f"{report.path.stem}_cleaned{report.path.suffix}")
+        cleaned.write_bytes(report.path.read_bytes())
+        return cleaned
+
+    monkeypatch.setattr(watcher.analyzer, "analyze", fake_analyze)
+    monkeypatch.setattr(watcher, "remove_all", fake_remove_all)
+
+    handler = DMSEventHandler(mode="clean", strip_annotations=True, strip_attachments=True)
+    handler.process(source)
+
+    assert received == [(True, True)]
+
+
+def test_watcher_spoof_clean_strips_residual_signature_and_restores_dates(tmp_path, monkeypatch) -> None:
+    import subprocess
+    from datetime import datetime
+    from dms.core.models import MetaField
+
+    source = tmp_path / "photo.jpg"
+    source.write_bytes(b"jpeg")
+    dest = tmp_path / "photo_spoofed.jpg"
+
+    before_report = FileReport(
+        path=source,
+        file_type="jpeg",
+        fields=[
+            MetaField("EXIF:DateTimeOriginal", "DateTimeOriginal", "Create Date", "2023:01:01 10:00:00", "dates", True, True, is_computed=False, status="risk"),
+            MetaField("XMP:Rights", "Rights", "Rights", "Secret Owner", "other", True, True, is_computed=False, status="risk"),
+        ],
+    )
+    after_spoof_report = FileReport(
+        path=dest,
+        file_type="jpeg",
+        fields=[
+            MetaField("EXIF:DateTimeOriginal", "DateTimeOriginal", "Create Date", "2021:05:10 08:30:00", "dates", True, True, is_computed=False, status="risk"),
+            MetaField("XMP:Rights", "Rights", "Rights", "Secret Owner", "other", True, True, is_computed=False, status="risk"),
+        ],
+    )
+
+    def fake_analyze(path: Path) -> FileReport:
+        return after_spoof_report if Path(path) == dest else before_report
+
+    def fake_apply_smart_spoof(report: FileReport, output_path: Path | None = None):
+        out = output_path or report.path.with_name("photo_spoofed.jpg")
+        out.write_bytes(b"spoofed")
+        return out, ["dates"], []
+
+    exiftool_calls: list[list[str]] = []
+    sig_calls: list[Path] = []
+    fs_calls: list[tuple[Path, datetime]] = []
+
+    monkeypatch.setattr(watcher.analyzer, "analyze", fake_analyze)
+    monkeypatch.setattr(watcher, "apply_smart_spoof", fake_apply_smart_spoof)
+    monkeypatch.setattr(watcher, "require_exiftool", lambda: "exiftool")
+    monkeypatch.setattr(
+        watcher.subprocess,
+        "run",
+        lambda args, **_kwargs: exiftool_calls.append(list(args)) or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(watcher, "remove_exiftool_signature", lambda p, _et: sig_calls.append(p))
+    monkeypatch.setattr(watcher, "set_filesystem_dates", lambda p, dt: fs_calls.append((p, dt)))
+
+    handler = DMSEventHandler(mode="spoof_clean")
+    handler.process(source)
+
+    assert len(exiftool_calls) == 1
+    assert "-m" in exiftool_calls[0]
+    assert "-XMP:Rights=" in exiftool_calls[0]
+    assert sig_calls == [dest]
+    assert fs_calls == [(dest, datetime(2021, 5, 10, 8, 30, 0))]
